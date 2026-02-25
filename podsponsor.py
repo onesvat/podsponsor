@@ -46,6 +46,7 @@ class PodsponsorConfig:
         self.w_model = self.data.get("whisper", {}).get("model", "medium")
         self.w_device = self.data.get("whisper", {}).get("device", "cuda")
         self.w_compute = self.data.get("whisper", {}).get("compute_type", "float16")
+        self.w_batch_size = int(self.data.get("whisper", {}).get("batch_size", 16))
 
         # LLM settings
         llm = self.data.get("llm", {})
@@ -318,35 +319,22 @@ class Transcriber:
         torch.backends.cudnn.allow_tf32 = True
         warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
 
-    def transcribe(self, audio_path: Path) -> dict:
+    def transcribe(self, audio_path: Path, language: str | None = None) -> dict:
         import whisperx
 
         if self._model is None:
-            logger.info("Loading WhisperX model '%s' on %s", self.config.w_model, self.config.w_device)
+            logger.info("Loading WhisperX model '%s' on %s (language=%s)", self.config.w_model, self.config.w_device, language or 'auto')
             self._model = whisperx.load_model(
                 self.config.w_model,
                 self.config.w_device,
                 compute_type=self.config.w_compute,
-                threads=self.config.w_workers,
+                language=language,
             )
 
         audio = whisperx.load_audio(str(audio_path))
         logger.info("Transcribing %s...", audio_path.name)
-        result = self._model.transcribe(audio, batch_size=4)
-
-        logger.info("Aligning %s at word level...", audio_path.name)
-        align_model, align_metadata = whisperx.load_align_model(
-            language_code=result["language"],
-            device=self.config.w_device,
-        )
-        return whisperx.align(
-            result["segments"],
-            align_model,
-            align_metadata,
-            audio,
-            self.config.w_device,
-            return_char_alignments=False,
-        )
+        result = self._model.transcribe(audio, batch_size=self.config.w_batch_size, language=language)
+        return result
 
 
 def format_srt_ts(seconds: float) -> str:
@@ -758,6 +746,24 @@ class Processor:
         self.transcriber = Transcriber(self.config)
         self.pattern_stores: Dict[Path, PatternStore] = {}
         self.manifests: Dict[Path, ManifestStore] = {}
+        self._show_languages: Dict[Path, str | None] = {}
+
+    def _get_show_language(self, show_dir: Path) -> str | None:
+        """Read language from metadata.json if present."""
+        if show_dir not in self._show_languages:
+            meta_path = show_dir / "metadata.json"
+            lang = None
+            if meta_path.exists():
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                    lang = meta.get("language")
+                    if lang:
+                        logger.info("Using language '%s' from %s", lang, meta_path)
+                except (OSError, json.JSONDecodeError) as exc:
+                    logger.warning("Could not read metadata.json: %s", exc)
+            self._show_languages[show_dir] = lang
+        return self._show_languages[show_dir]
 
     def _get_pattern_store(self, show_dir: Path) -> PatternStore:
         if show_dir not in self.pattern_stores:
@@ -790,8 +796,9 @@ class Processor:
             except OSError as exc:
                 logger.warning("Failed to delete orphaned .srt %s: %s", srt_path.name, exc)
             
+        language = self._get_show_language(mp3_path.parent)
         logger.info("Transcribing (full run): %s", mp3_path.name)
-        result = self.transcriber.transcribe(mp3_path)
+        result = self.transcriber.transcribe(mp3_path, language=language)
         segments = result.get("segments", [])
 
         if not segments:
