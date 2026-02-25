@@ -34,7 +34,7 @@ def get_global_patterns_path() -> Path:
     env_path = os.environ.get("PODSPONSOR_GLOBAL_PATTERNS")
     if env_path:
         return Path(env_path)
-    return Path.home() / ".podsponsor" / "patterns.json"
+    return Path.home() / ".podsponsor" / "ads.json"
 
 
 class PodsponsorConfig:
@@ -53,8 +53,14 @@ class PodsponsorConfig:
         self.summary_lang = llm.get("summary_language", "en")
         
         default_prompt = (
-            "You are an expert podcast analyst. Your job is to identify sponsor ad reads and generate a detailed summary of the episode.\n"
+            "You are an expert podcast analyst. Your job is to identify sponsor ad reads and generate a detailed, structured summary of the episode.\n"
             "The episode summary must strictly be written in {summary_language}.\n\n"
+            
+            "Format the summary using clear markdown sections and bullet points. Include the following sections:\n"
+            "- **Main Topics Discussed**: Core subjects covered in the episode.\n"
+            "- **Key Takeaways & Ideas**: The most important concepts, mental models, or actionable advice (focus on what is worth remembering; ignore casual banter).\n"
+            "- **References & Resources**: Any books, articles, people, tools, or other media mentioned.\n\n"
+            
             "Here are the transcribed audio segments. Each segment has an ID. Some segments are marked with [REPEATED].\n"
             "Return the detected ad blocks with their starting and ending segment indices."
         )
