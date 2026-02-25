@@ -1043,6 +1043,7 @@ def main():
     parser.add_argument("--clear-patterns", action="store_true", help="Clear global pattern DB")
     parser.add_argument("--force", action="store_true", help="Reprocess files even if manifest says success")
     parser.add_argument("--config", default="config.yaml", help="Path to config file")
+    parser.add_argument("--transcribe-only", action="store_true", help="Only generate .srt and .words.json files, skip LLM and cutting")
 
     args = parser.parse_args()
 
@@ -1089,6 +1090,10 @@ def main():
             processor.ensure_transcription(target)
         except Exception as exc:
             logger.error("Transcription failed for %s: %s", target.name, exc)
+
+    if args.transcribe_only:
+        logger.info("--transcribe-only flag detected. Transcription complete. Exiting.")
+        return
 
     # Cross-file matching
     logger.info("=== Cross-File Matching ===")
