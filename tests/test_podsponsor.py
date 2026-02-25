@@ -11,36 +11,10 @@ from podsponsor import (
     load_words_json,
     normalize_cut_regions,
     parse_llm_ad_blocks,
-    parse_srt,
     save_words_json,
     expand_ad_indices,
     shift_transcript,
 )
-
-
-class ParseSrtTests(unittest.TestCase):
-    def test_parse_srt_blocks(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            srt_path = Path(tmp) / "episode.srt"
-            srt_path.write_text(
-                """1
-00:00:01,000 --> 00:00:02,500
-Hello world
-
-2
-00:00:03,000 --> 00:00:05,000
-Second line
-with continuation
-""",
-                encoding="utf-8",
-            )
-
-            segments = parse_srt(srt_path)
-            self.assertEqual(2, len(segments))
-            self.assertAlmostEqual(1.0, segments[0]["start"])
-            self.assertAlmostEqual(2.5, segments[0]["end"])
-            self.assertEqual("Hello world", segments[0]["text"])
-            self.assertEqual("Second line with continuation", segments[1]["text"])
 
 
 class ManifestTests(unittest.TestCase):

@@ -310,9 +310,15 @@ class Transcriber:
     def __init__(self, config: PodsponsorConfig):
         self.config = config
         self._model = None
+        
+        # Suppress aggressive Pyannote warnings about TF32
+        import torch
+        import warnings
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
 
     def transcribe(self, audio_path: Path) -> dict:
-        maybe_apply_runtime_lib_dir(self.config.ffmpeg_lib_dir)
         import whisperx
 
         if self._model is None:
@@ -364,38 +370,6 @@ def save_srt(segments: List[dict], filepath: Path):
             f.write(f"{segment['text'].strip()}\n\n")
 
 
-def parse_srt(filepath: Path) -> List[dict]:
-    try:
-        content = filepath.read_text(encoding="utf-8")
-    except OSError as exc:
-        logger.warning("Could not read SRT %s: %s", filepath, exc)
-        return []
-
-    segments: List[dict] = []
-    for block in content.split("\n\n"):
-        lines = [line.strip() for line in block.splitlines() if line.strip()]
-        if len(lines) < 2:
-            continue
-
-        timing_idx = 0 if "-->" in lines[0] else 1
-        if timing_idx >= len(lines) or "-->" not in lines[timing_idx]:
-            continue
-
-        try:
-            start_raw, end_raw = [item.strip() for item in lines[timing_idx].split("-->", 1)]
-            start = parse_srt_ts(start_raw)
-            end = parse_srt_ts(end_raw)
-        except (ValueError, IndexError):
-            continue
-
-        text_lines = lines[timing_idx + 1 :]
-        text = " ".join(text_lines).strip()
-        if not text:
-            continue
-
-        segments.append({"start": start, "end": end, "text": text})
-
-    return segments
 
 
 # --- Words JSON ---
@@ -807,10 +781,16 @@ class Processor:
                 return
 
         # Need to transcribe (even if SRT exists, we need word-level data)
+        # However, to prevent partial states, if a legacy or orphaned .srt exists 
+        # but the .words.json is missing, we delete the .srt and force a clean run.
         if srt_path.exists() and not words_path.exists():
-            logger.info("SRT exists but no word-level data, re-transcribing: %s", mp3_path.name)
-
-        logger.info("Transcribing: %s", mp3_path.name)
+            logger.warning("Orphaned .srt found without .words.json. Deleting .srt to force clean sync: %s", srt_path.name)
+            try:
+                srt_path.unlink()
+            except OSError as exc:
+                logger.warning("Failed to delete orphaned .srt %s: %s", srt_path.name, exc)
+            
+        logger.info("Transcribing (full run): %s", mp3_path.name)
         result = self.transcriber.transcribe(mp3_path)
         segments = result.get("segments", [])
 
