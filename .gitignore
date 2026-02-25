@@ -1,0 +1,21 @@
+# Python/Env ignores
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+
+# User configurations & Secrets
+config.yaml
+.env
+
+# IDEs & OS junk
+.vscode/
+.idea/
+.DS_Store
+
+# Local application state/logs
+*.log
+
