@@ -12,7 +12,6 @@ from podsponsor import (
     normalize_cut_regions,
     parse_llm_ad_blocks,
     save_words_json,
-    expand_ad_indices,
     shift_transcript,
 )
 
@@ -92,7 +91,12 @@ class CrossFileMatchingTests(unittest.TestCase):
             {"start": 10, "end": 15, "text": "Today we discuss history"},
         ]
         all_segs = {Path("/a.mp3"): segments_a, Path("/b.mp3"): segments_b}
-        suspicious = find_repeated_segments(all_segs, sim_threshold=0.80)
+        suspicious = find_repeated_segments(
+            targets=list(all_segs.keys()),
+            new_targets=set(all_segs.keys()),
+            sim_threshold=0.80,
+            load_all_segments_func=lambda x: all_segs
+        )
 
         self.assertIn(1, suspicious.get(Path("/a.mp3"), set()))
         self.assertIn(1, suspicious.get(Path("/b.mp3"), set()))
@@ -105,7 +109,12 @@ class CrossFileMatchingTests(unittest.TestCase):
             {"start": 5, "end": 10, "text": "This is a unique segment number two"},
         ]
         all_segs = {Path("/a.mp3"): segments}
-        suspicious = find_repeated_segments(all_segs, sim_threshold=0.80)
+        suspicious = find_repeated_segments(
+            targets=list(all_segs.keys()),
+            new_targets=set(all_segs.keys()),
+            sim_threshold=0.80,
+            load_all_segments_func=lambda x: all_segs
+        )
         self.assertEqual(0, sum(len(v) for v in suspicious.values()))
 
 
@@ -140,31 +149,6 @@ class ParseLlmAdBlocksTests(unittest.TestCase):
     def test_handles_non_list(self):
         blocks = parse_llm_ad_blocks("not a list", max_index=30, min_confidence=0.70)
         self.assertEqual(0, len(blocks))
-
-
-class NeighbourExpansionTests(unittest.TestCase):
-    def test_expands_only_suspicious_neighbours(self):
-        ad_blocks = [(5, 7, 0.95)]
-        suspicious = {3, 4, 5, 6, 7, 8}  # 3,4 before; 8 after are suspicious
-        result = expand_ad_indices(ad_blocks, suspicious, total_segments=20, expand_range=2)
-
-        # Original block
-        self.assertIn(5, result)
-        self.assertIn(6, result)
-        self.assertIn(7, result)
-        # Expanded (suspicious neighbours)
-        self.assertIn(4, result)
-        self.assertIn(3, result)
-        self.assertIn(8, result)
-        # Not expanded (not suspicious)
-        self.assertNotIn(9, result)
-
-    def test_no_expansion_without_suspicious(self):
-        ad_blocks = [(5, 7, 0.95)]
-        suspicious = set()  # No suspicious neighbours
-        result = expand_ad_indices(ad_blocks, suspicious, total_segments=20, expand_range=2)
-
-        self.assertEqual({5, 6, 7}, result)
 
 
 class ProcessorFlowTests(unittest.TestCase):

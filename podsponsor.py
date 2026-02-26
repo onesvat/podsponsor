@@ -1,11 +1,14 @@
 import argparse
+import hashlib
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 import subprocess
 import sys
 from collections import defaultdict
+import concurrent.futures
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -172,17 +175,36 @@ class PatternStore:
         self._local_set = set(self.local_patterns)
         self._global_set = set(self.global_patterns)
 
+        # Pre-compute normalized texts and trigrams for fast matching
+        self._local_normalized = [p.strip().lower() for p in self.local_patterns]
+        self._global_normalized = [p.strip().lower() for p in self.global_patterns]
+        self._local_trigrams = [self._make_trigrams(p) for p in self._local_normalized]
+        self._global_trigrams = [self._make_trigrams(p) for p in self._global_normalized]
+
+    @staticmethod
+    def _make_trigrams(text: str) -> Set[str]:
+        return set(text[i:i+3] for i in range(max(1, len(text) - 2)))
+
     def is_known_ad(self, text: str, threshold: float) -> bool:
         t1 = text.strip().lower()
         if len(t1) < 20:
             return False
 
-        for pattern in self.local_patterns:
-            if SequenceMatcher(None, t1, pattern.strip().lower()).ratio() > threshold:
+        t1_trigrams = self._make_trigrams(t1)
+
+        for pattern, tri in zip(self._local_normalized, self._local_trigrams):
+            # Quick trigram overlap check before expensive SequenceMatcher
+            min_tri = min(len(t1_trigrams), len(tri))
+            if min_tri > 0 and len(t1_trigrams & tri) / min_tri < 0.3:
+                continue
+            if SequenceMatcher(None, t1, pattern).ratio() > threshold:
                 return True
 
-        for pattern in self.global_patterns:
-            if SequenceMatcher(None, t1, pattern.strip().lower()).ratio() > threshold:
+        for pattern, tri in zip(self._global_normalized, self._global_trigrams):
+            min_tri = min(len(t1_trigrams), len(tri))
+            if min_tri > 0 and len(t1_trigrams & tri) / min_tri < 0.3:
+                continue
+            if SequenceMatcher(None, t1, pattern).ratio() > threshold:
                 return True
 
         return False
@@ -206,9 +228,13 @@ class PatternStore:
             global_changed = True
 
         if local_changed:
+            self._local_normalized.append(cleaned.lower())
+            self._local_trigrams.append(self._make_trigrams(cleaned.lower()))
             save_json_atomic(self.local_path, self.local_patterns)
 
         if global_changed:
+            self._global_normalized.append(cleaned.lower())
+            self._global_trigrams.append(self._make_trigrams(cleaned.lower()))
             save_json_atomic(self.global_path, self.global_patterns)
 
 
@@ -394,18 +420,97 @@ def load_words_json(filepath: Path) -> List[dict]:
 
 
 # --- Cross-File Matching ---
+
+# Global state for fast forked multiprocessing (zero-copy overhead on Linux).
+# Keys: unique_texts (List[str]), text_to_file_indices (Dict[str, List[Tuple[Path, int]]]),
+#        text_trigrams (List[Set[str]]), text_lens (List[int]),
+#        sim_threshold (float), is_new (List[bool])
+_FUZZY_STATE: Dict[str, object] = {}
+
+def _process_fuzzy_chunk(start_idx: int, end_idx: int) -> Tuple[int, int, List[Tuple[Path, int]]]:
+    unique_texts = _FUZZY_STATE["unique_texts"]
+    text_to_file_indices = _FUZZY_STATE["text_to_file_indices"]
+    text_trigrams = _FUZZY_STATE["text_trigrams"]
+    text_lens = _FUZZY_STATE["text_lens"]
+    sim_threshold = _FUZZY_STATE["sim_threshold"]
+    is_new = _FUZZY_STATE["is_new"]
+
+    comparisons = 0
+    matches = 0
+    suspicious_pairs = []
+    
+    n = len(unique_texts)
+    
+    for i in range(start_idx, end_idx):
+        is_new_b = is_new[i]
+        text_b = unique_texts[i]
+        files_b = {fp for fp, _ in text_to_file_indices[text_b]}
+        len_b = text_lens[i]
+        tri_b = text_trigrams[i]
+        
+        sm = SequenceMatcher(None, "", text_b)
+        
+        for j in range(i + 1, n):
+            # 1-to-N OPTIMIZATION: Skip comparing two old texts
+            if not is_new_b and not is_new[j]:
+                continue
+
+            len_a = text_lens[j]
+            if len_a - len_b > len_b * 0.3:
+                break
+                
+            text_a = unique_texts[j]
+            files_a = {fp for fp, _ in text_to_file_indices[text_a]}
+            if not (files_a - files_b):
+                continue
+                
+            tri_a = text_trigrams[j]
+            overlap = len(tri_a & tri_b)
+            min_tri = min(len(tri_a), len(tri_b))
+            if min_tri > 0 and (overlap / min_tri) < 0.3:
+                continue
+                
+            sm.set_seq1(text_a)
+            comparisons += 1
+            if sm.ratio() > sim_threshold:
+                matches += 1
+                suspicious_pairs.extend(text_to_file_indices[text_b])
+                suspicious_pairs.extend(text_to_file_indices[text_a])
+                
+    return comparisons, matches, suspicious_pairs
+
+
 def find_repeated_segments(
-    all_segments: Dict[Path, List[dict]],
+    targets: List[Path],
+    new_targets: Set[Path],
     sim_threshold: float,
+    load_all_segments_func=None,
 ) -> Dict[Path, Set[int]]:
     """Find segments that appear in multiple files (likely ads).
 
     Uses exact-match hashing on normalized text for O(n) performance.
     Also runs fuzzy matching via SequenceMatcher for near-duplicates.
+    Optimized for 1-to-N matching: only processes when new targets are present.
     """
-    # Build index: normalized_text -> set of files it appears in
+    import time
+
+    t0 = time.time()
+    logger.info("Starting cross-file match for %d total targets (%d new targets to compare)", len(targets), len(new_targets))
+
+    if not new_targets:
+        logger.info("No new targets to cross-match. Returning empty results.")
+        return {}
+
+    if load_all_segments_func is None:
+        raise ValueError("load_all_segments_func must be provided when calling find_repeated_segments")
+    all_segments = load_all_segments_func(targets)
+
+    total_segs = sum(len(s) for s in all_segments.values())
+    logger.info("Cross-file matching: starting matching on %d files, %d total segments (threshold=%.2f)",
+                len(targets), total_segs, sim_threshold)
+
+    # --- Phase 1: Build Index ---
     text_to_files: Dict[str, Set[Path]] = defaultdict(set)
-    # Also track: normalized_text -> list of (file, segment_index) for mapping back
     text_to_locations: Dict[str, List[Tuple[Path, int]]] = defaultdict(list)
 
     for file_path, segments in all_segments.items():
@@ -416,60 +521,115 @@ def find_repeated_segments(
             text_to_files[normalized].add(file_path)
             text_to_locations[normalized].append((file_path, idx))
 
-    # Collect suspicious indices per file (exact matches in ≥2 files)
+    t1 = time.time()
+    logger.info("Cross-file matching: indexing done in %.1fs — %d unique texts indexed", t1 - t0, len(text_to_files))
+
+    # --- Phase 2: Exact Matches ---
     suspicious: Dict[Path, Set[int]] = defaultdict(set)
     for normalized, files in text_to_files.items():
         if len(files) >= 2:
-            for file_path, idx in text_to_locations[normalized]:
-                suspicious[file_path].add(idx)
+            # 1-to-N OPTIMIZATION: Only flag if at least one file is in new_targets
+            if any(f in new_targets for f in files):
+                for file_path, idx in text_to_locations[normalized]:
+                    suspicious[file_path].add(idx)
 
-    # Fuzzy matching: compare unique texts that didn't exact-match
-    exact_matched = {t for t, files in text_to_files.items() if len(files) >= 2}
-    unique_texts = [(t, locs) for t, locs in text_to_locations.items() if t not in exact_matched and len(locs) >= 2]
+    exact_count = sum(len(v) for v in suspicious.values())
+    t2 = time.time()
+    logger.info("Cross-file matching: exact-match phase done in %.1fs — %d exact duplicates across %d files",
+                t2 - t1, exact_count, len(suspicious))
 
-    for text, locations in unique_texts:
-        # Check if this text appears in multiple files (fuzzy)
-        files_for_text = set()
-        for file_path, _ in locations:
-            files_for_text.add(file_path)
-
-        if len(files_for_text) < 2:
-            continue
-
-        # Compare across files
-        file_groups: Dict[Path, List[Tuple[int, str]]] = defaultdict(list)
-        for file_path, idx in locations:
-            file_groups[file_path].append((idx, text))
-
-        # If same normalized text in multiple files, already handled above
-        # Here we handle different-but-similar texts across files
-        pass
-
-    # Fuzzy: compare segments across files using SequenceMatcher
-    # Only compare unique texts from different files, limited to reasonable count
-    all_unique_by_file: Dict[Path, List[Tuple[int, str]]] = defaultdict(list)
+    # --- Phase 3: Fuzzy Matching (with SM set_seq2 caching + global text dedup) ---
+    # Collect unique texts not already flagged, with their (file, idx) mappings
+    text_to_file_indices: Dict[str, List[Tuple[Path, int]]] = defaultdict(list)
     for file_path, segments in all_segments.items():
         for idx, seg in enumerate(segments):
             normalized = seg.get("text", "").strip().lower()
             if len(normalized) < 20:
                 continue
             if idx not in suspicious.get(file_path, set()):
-                all_unique_by_file[file_path].append((idx, normalized))
+                text_to_file_indices[normalized].append((file_path, idx))
 
-    file_list = list(all_unique_by_file.keys())
-    for i in range(len(file_list)):
-        for j in range(i + 1, len(file_list)):
-            file_a, file_b = file_list[i], file_list[j]
-            for idx_a, text_a in all_unique_by_file[file_a]:
-                for idx_b, text_b in all_unique_by_file[file_b]:
-                    if abs(len(text_a) - len(text_b)) > len(text_a) * 0.3:
-                        continue  # Skip very different lengths
-                    if SequenceMatcher(None, text_a, text_b).ratio() > sim_threshold:
-                        suspicious[file_a].add(idx_a)
-                        suspicious[file_b].add(idx_b)
+    # Deduplicate: flatten to unique text list with file mappings
+    unique_texts = list(text_to_file_indices.keys())
+    # Pre-sort by length for efficient length-filter skipping
+    unique_texts.sort(key=len)
 
+    # 1-to-N OPTIMIZATION: Pre-calculate is_new array for fast access in fuzzy loop
+    is_new = [
+        any(fp in new_targets for fp, _ in text_to_file_indices[t])
+        for t in unique_texts
+    ]
+
+    n = len(unique_texts)
+    logger.info("Cross-file matching: fuzzy phase starting — %d unique texts to compare (from %d file-segments)",
+                n, sum(len(v) for v in text_to_file_indices.values()))
+
+    # Pre-compute trigrams for fast LSH-style filtering
+    text_trigrams = [set(t[k:k+3] for k in range(max(1, len(t)-2))) for t in unique_texts]
+    text_lens = [len(t) for t in unique_texts]
+
+    fuzzy_comparisons = 0
+    fuzzy_matches = 0
+    t3 = time.time()
+    last_log = t3
+
+    # Populate global state for fork-based ProcessPoolExecutor
+    global _FUZZY_STATE
+    _FUZZY_STATE = {
+        "unique_texts": unique_texts,
+        "text_to_file_indices": text_to_file_indices,
+        "text_trigrams": text_trigrams,
+        "text_lens": text_lens,
+        "sim_threshold": sim_threshold,
+        "is_new": is_new,
+    }
+
+    # Decide chunks based on CPU cores
+    num_cores = os.cpu_count() or 4
+    num_chunks = max(1, num_cores * 4)
+    chunk_size = max(1, n // num_chunks)
+    chunks = []
+    
+    # Calculate boundaries
+    idx = 0
+    while idx < n:
+        chunks.append((idx, min(idx + chunk_size, n)))
+        idx += chunk_size
+
+    logger.info("Cross-file matching: spawning %d processes across %d chunks...", num_cores, len(chunks))
+
+    fork_ctx = multiprocessing.get_context("fork")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores, mp_context=fork_ctx) as executor:
+        futures = {executor.submit(_process_fuzzy_chunk, start_i, end_i): (start_i, end_i) for start_i, end_i in chunks}
+        
+        chunks_done = 0
+        for future in concurrent.futures.as_completed(futures):
+            comps, mats, susp_pairs = future.result()
+            fuzzy_comparisons += comps
+            fuzzy_matches += mats
+            for fp, susp_idx in susp_pairs:
+                suspicious[fp].add(susp_idx)
+            
+            chunks_done += 1
+            now = time.time()
+            if now - last_log >= 30 or chunks_done == len(chunks):
+                elapsed = now - t3
+                logger.info(
+                    "Cross-file matching: fuzzy progress %d/%d chunks (%.0f%%) — %d comparisons, %d matches, %.0fs elapsed",
+                    chunks_done, len(chunks), 100 * chunks_done / len(chunks),
+                    fuzzy_comparisons, fuzzy_matches, elapsed
+                )
+                last_log = now
+
+    t4 = time.time()
     total = sum(len(v) for v in suspicious.values())
-    logger.info("Cross-file matching: found %d suspicious segments across %d files", total, len(suspicious))
+    logger.info(
+        "Cross-file matching: DONE in %.1fs total (index=%.1fs, exact=%.1fs, fuzzy=%.1fs) — "
+        "%d suspicious segments across %d files, %d fuzzy comparisons, %d fuzzy matches",
+        t4 - t0, t1 - t0, t2 - t1, t4 - t3,
+        total, len(suspicious), fuzzy_comparisons, fuzzy_matches
+    )
+
     return dict(suspicious)
 
 
@@ -585,33 +745,6 @@ def parse_llm_ad_blocks(raw_ads, max_index: int, min_confidence: float) -> List[
         blocks.append((start, end, confidence))
 
     return blocks
-
-
-def expand_ad_indices(
-    ad_blocks: List[Tuple[int, int, float]],
-    suspicious: Set[int],
-    total_segments: int,
-    expand_range: int = 2,
-) -> set[int]:
-    """Expand ad blocks by ±expand_range, including neighbours only if they are suspicious."""
-    all_ad_indices: set[int] = set()
-
-    for start, end, _ in ad_blocks:
-        # Add all segments in the block
-        for i in range(start, end + 1):
-            all_ad_indices.add(i)
-
-        # Expand backwards
-        for i in range(max(0, start - expand_range), start):
-            if i in suspicious:
-                all_ad_indices.add(i)
-
-        # Expand forwards
-        for i in range(end + 1, min(total_segments, end + 1 + expand_range)):
-            if i in suspicious:
-                all_ad_indices.add(i)
-
-    return all_ad_indices
 
 
 def group_contiguous(indices: List[int]) -> List[List[int]]:
@@ -741,8 +874,11 @@ def get_audio_duration(path: Path) -> float:
         "default=noprint_wrappers=1:nokey=1",
         str(path),
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return float(res.stdout.strip())
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return float(res.stdout.strip())
+    except (subprocess.CalledProcessError, ValueError) as exc:
+        raise RuntimeError(f"Failed to get audio duration for {path.name}: {exc}") from exc
 
 
 # --- Processor Engine ---
@@ -753,6 +889,7 @@ class Processor:
         self.pattern_stores: Dict[Path, PatternStore] = {}
         self.manifests: Dict[Path, ManifestStore] = {}
         self._show_languages: Dict[Path, str | None] = {}
+        self._segments_mem_cache: Dict[Path, List[dict]] = {}
 
     def _get_show_language(self, show_dir: Path) -> str | None:
         """Read language from metadata.json if present."""
@@ -816,15 +953,24 @@ class Processor:
         save_srt(segments, srt_path)
         logger.info("Saved word-level data and SRT for: %s", mp3_path.name)
 
-    def load_all_segments(self, targets: List[Path]) -> Dict[Path, List[dict]]:
-        """Load segments from .words.json for all target files."""
-        all_segments: Dict[Path, List[dict]] = {}
+    def preload_all_segments(self, targets: List[Path]):
+        """Preload all segment files into memory sequentially."""
+        logger.info("Pre-loading segments into memory sequentially...")
         for mp3_path in targets:
             words_path = mp3_path.with_suffix(".words.json")
             if words_path.exists():
                 segments = load_words_json(words_path)
                 if segments:
-                    all_segments[mp3_path] = segments
+                    self._segments_mem_cache[mp3_path] = segments
+            
+        logger.info("Pre-loaded %d segment files into memory.", len(self._segments_mem_cache))
+
+    def load_all_segments(self, targets: List[Path]) -> Dict[Path, List[dict]]:
+        """Return segments for all target files from memory cache."""
+        all_segments: Dict[Path, List[dict]] = {}
+        for mp3_path in targets:
+            if mp3_path in self._segments_mem_cache:
+                all_segments[mp3_path] = self._segments_mem_cache[mp3_path]
         return all_segments
 
     def get_exact_word_timing(self, segment: dict, boundary: str) -> float:
@@ -841,7 +987,7 @@ class Processor:
             return float(valid_words[0]["start"])
         return float(valid_words[-1]["end"])
 
-    def process_file(self, mp3_path: Path, suspicious: Set[int], force: bool = False) -> str:
+    def process_file(self, mp3_path: Path, suspicious: Set[int], force: bool = False, dry_run: bool = False) -> str:
         """Phase 2: Detect ads and cut audio for a single file."""
         manifest = self._get_manifest(mp3_path.parent)
         pattern_store = self._get_pattern_store(mp3_path.parent)
@@ -856,8 +1002,12 @@ class Processor:
         stage = "load"
 
         try:
-            # Load segments from .words.json (has word-level timings)
-            segments = load_words_json(words_path)
+            # Load segments from memory cache or disk
+            segments = self._segments_mem_cache.get(mp3_path)
+            
+            if not segments:
+                segments = load_words_json(words_path)
+                
             if not segments:
                 raise RuntimeError(f"No word-level data found for {mp3_path.name}")
 
@@ -893,11 +1043,15 @@ class Processor:
 
             if not ad_blocks:
                 logger.info("No ads detected (after confidence filter). Skipping cut.")
-                manifest.mark_success(mp3_path, fingerprint)
+                if not dry_run:
+                    manifest.mark_success(mp3_path, fingerprint)
                 return "processed"
 
-            # Expand with neighbours (only if also suspicious)
-            all_ad_indices = expand_ad_indices(ad_blocks, all_suspicious, len(segments))
+            # Collect ad segment indices directly from LLM blocks
+            all_ad_indices: set[int] = set()
+            for start, end, _ in ad_blocks:
+                for i in range(start, end + 1):
+                    all_ad_indices.add(i)
 
             # Group into contiguous blocks
             sorted_indices = sorted(all_ad_indices)
@@ -951,7 +1105,8 @@ class Processor:
 
             if not cut_regions:
                 logger.info("No ad regions survived filtering. Skipping cut.")
-                manifest.mark_success(mp3_path, fingerprint)
+                if not dry_run:
+                    manifest.mark_success(mp3_path, fingerprint)
                 return "processed"
 
             # Safety guardrail: if total ad time > 50% of episode, skip
@@ -962,8 +1117,16 @@ class Processor:
                     "SAFETY: Ad time (%.1fs) is %.0f%% of episode (%.1fs) — skipping cut for %s",
                     total_ad_time, ad_ratio * 100, total_duration, mp3_path.name,
                 )
-                manifest.mark_failed(mp3_path, "safety", fingerprint, f"Ad ratio too high: {ad_ratio:.2f}")
+                if not dry_run:
+                    manifest.mark_failed(mp3_path, "safety", fingerprint, f"Ad ratio too high: {ad_ratio:.2f}")
                 return "failed"
+
+            if dry_run:
+                logger.info("DRY RUN: Would cut %.1fs of ads (%.0f%% of %.1fs) from %s",
+                            total_ad_time, ad_ratio * 100, total_duration, mp3_path.name)
+                for region_start, region_end in cut_regions:
+                    logger.info("  Would cut: %.2fs - %.2fs (%.1fs)", region_start, region_end, region_end - region_start)
+                return "processed"
 
             # Cut audio
             stage = "cut"
@@ -1025,8 +1188,7 @@ class Processor:
                     orig_file = mp3_path.with_suffix(ext)
                     if orig_file.exists():
                         backup_file = backup_dir / orig_file.name
-                        if not backup_file.exists():
-                            shutil.copy2(orig_file, backup_file)
+                        shutil.copy2(orig_file, backup_file)
 
             shutil.move(out_path, mp3_path)
             
@@ -1037,7 +1199,11 @@ class Processor:
             
             logger.info("Done. Clean file and updated transcripts are at %s", mp3_path)
         else:
-            logger.info("Done. Clean file generated: %s", out_path.name)
+            # save_as_clean: also generate shifted transcripts for the clean file
+            shifted_segments = shift_transcript(segments, keep_regions)
+            save_words_json(shifted_segments, mp3_path.with_name(f"{mp3_path.stem}-clean.words.json"))
+            save_srt(shifted_segments, mp3_path.with_name(f"{mp3_path.stem}-clean.srt"))
+            logger.info("Done. Clean file and shifted transcripts generated: %s", out_path.name)
 
 
 def should_process_mp3(path: Path) -> bool:
@@ -1055,6 +1221,7 @@ def main():
     parser.add_argument("--list-patterns", action="store_true", help="List known global ad patterns")
     parser.add_argument("--clear-patterns", action="store_true", help="Clear global pattern DB")
     parser.add_argument("--force", action="store_true", help="Reprocess files even if manifest says success")
+    parser.add_argument("--dry-run", action="store_true", help="Detect ads and show what would be cut without modifying any files")
     parser.add_argument("--config", default="config.yaml", help="Path to config file")
     parser.add_argument("--transcribe-only", action="store_true", help="Only generate .srt and .words.json files, skip LLM and cutting")
 
@@ -1096,6 +1263,10 @@ def main():
     targets.sort()
     logger.info("Found %d files to process.", len(targets))
 
+    # Identify new targets that actually need cross-matching and processing
+    new_targets = {t for t in targets if not processor._get_manifest(t.parent).should_skip(t, force=args.force)}
+    logger.info("%d files identified as new/unprocessed.", len(new_targets))
+
     # Phase 1: Transcribe all files
     logger.info("=== Phase 1: Transcription ===")
     for target in targets:
@@ -1108,10 +1279,18 @@ def main():
         logger.info("--transcribe-only flag detected. Transcription complete. Exiting.")
         return
 
+    # Preload segments to memory for massive I/O speedup
+    logger.info("=== Preloading Data ===")
+    processor.preload_all_segments(targets)
+
     # Cross-file matching
     logger.info("=== Cross-File Matching ===")
-    all_segments = processor.load_all_segments(targets)
-    suspicious = find_repeated_segments(all_segments, processor.config.sim_thresh)
+    suspicious = find_repeated_segments(
+        targets,
+        new_targets,
+        processor.config.sim_thresh, 
+        load_all_segments_func=processor.load_all_segments
+    )
 
     # Phase 2: Detect & cut
     logger.info("=== Phase 2: Detection & Cutting ===")
@@ -1120,7 +1299,7 @@ def main():
     failed = 0
 
     for target in targets:
-        status = processor.process_file(target, suspicious=suspicious.get(target, set()), force=args.force)
+        status = processor.process_file(target, suspicious=suspicious.get(target, set()), force=args.force, dry_run=args.dry_run)
         if status == "processed":
             processed += 1
         elif status == "skipped":
