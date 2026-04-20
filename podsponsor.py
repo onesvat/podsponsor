@@ -1,5 +1,4 @@
 import argparse
-import hashlib
 import json
 import logging
 import multiprocessing
@@ -12,13 +11,267 @@ import concurrent.futures
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+import time
+from typing import Any, Callable, Dict, List, Set, Tuple
 
 import yaml
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - dependency is expected at runtime
+    tqdm = None
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("podsponsor")
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+PROGRESS_PLAIN_LOG_INTERVAL_SECONDS = 10.0
+PROGRESS_EVENT_STATUSES = {
+    "queued",
+    "transcribing",
+    "transcribed",
+    "using_cached_llm",
+    "analyzing_llm",
+    "deriving_ad_blocks",
+    "cutting_audio",
+    "processed",
+    "skipped",
+    "failed",
+}
+ProgressCallback = Callable[[str, Path | None, Dict[str, Any]], None]
+FuzzyProgressCallback = Callable[[Dict[str, Any]], None]
+
+
+class TqdmLoggingHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord):
+        message = self.format(record)
+        if tqdm is not None:
+            tqdm.write(message)
+        else:  # pragma: no cover
+            print(message, file=sys.stderr)
+
+
+def default_log_file_path(now: datetime | None = None, cwd: Path | None = None) -> Path:
+    ts = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
+    base_dir = cwd or Path.cwd()
+    return base_dir / "logs" / f"podsponsor-{ts}.log"
+
+
+def configure_logging(use_tqdm_console: bool, log_file: Path | None = None) -> Path:
+    log_path = log_file or default_log_file_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+        handler.close()
+    root_logger.setLevel(logging.INFO)
+
+    if use_tqdm_console and tqdm is not None:
+        console_handler: logging.Handler = TqdmLoggingHandler()
+    else:
+        console_handler = logging.StreamHandler()
+    console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root_logger.addHandler(console_handler)
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    root_logger.addHandler(file_handler)
+
+    logger.info("Run log file: %s", log_path)
+    return log_path
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Podsponsor - Podcast Ad Remover")
+    parser.add_argument("path", nargs="?", help="Path to podcast MP3 or directory")
+    parser.add_argument("--force", action="store_true", help="Reprocess files even if sidecar status is success (ignores backups)")
+    parser.add_argument("--update", action="store_true", help="Re-crop audio/SRT from backup based on existing sidecar ad_blocks (skips LLM)")
+    parser.add_argument("--dry-run", action="store_true", help="Detect ads and show what would be cut without modifying any files")
+    parser.add_argument("--config", default="config.yaml", help="Path to config file")
+    parser.add_argument("--transcribe-only", action="store_true", help="Only generate .srt files and sidecar segments, skip LLM and cutting")
+    parser.add_argument(
+        "--progress",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Progress display mode. auto enables tqdm in TTY and plain progress logs otherwise.",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Write full run logs to this path (default: ./logs/podsponsor-YYYYMMDD-HHMMSS.log).",
+    )
+    return parser
+
+
+def resolve_progress_mode(progress_flag: str, stderr_is_tty: bool, tqdm_available: bool) -> str:
+    if progress_flag == "off":
+        return "off"
+    if progress_flag == "on":
+        return "tqdm" if tqdm_available else "plain"
+    return "tqdm" if stderr_is_tty and tqdm_available else "plain"
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    whole = max(0, int(seconds))
+    return f"{whole // 3600:02}:{(whole % 3600) // 60:02}:{whole % 60:02}"
+
+
+def _truncate_label(label: str, max_len: int = 48) -> str:
+    if len(label) <= max_len:
+        return label
+    return f"...{label[-(max_len - 3):]}"
+
+
+class RunProgressManager:
+    def __init__(self, mode: str):
+        self.mode = mode
+        self._phase_name = ""
+        self._phase_total = 0
+        self._phase_done = 0
+        self._phase_started_at = 0.0
+        self._phase_item_durations: List[float] = []
+        self._current_file = "-"
+        self._current_status = "-"
+        self._last_plain_log = 0.0
+        self._last_cross_plain_log = 0.0
+        self._phase_bar = None
+        self._cross_bar = None
+
+    def start_phase(self, phase_name: str, total: int):
+        self.finish_phase()
+        self._phase_name = phase_name
+        self._phase_total = max(0, total)
+        self._phase_done = 0
+        self._phase_started_at = time.monotonic()
+        self._phase_item_durations = []
+        self._current_file = "-"
+        self._current_status = "queued"
+        self._last_plain_log = 0.0
+
+        if self.mode == "tqdm" and tqdm is not None:
+            self._phase_bar = tqdm(
+                total=self._phase_total,
+                desc=phase_name,
+                unit="file",
+                dynamic_ncols=True,
+            )
+            self._refresh_tqdm_postfix()
+        elif self.mode == "plain":
+            logger.info("Progress: phase=%s total=%d", phase_name, self._phase_total)
+
+    def finish_phase(self):
+        if self._phase_bar is not None:
+            self._phase_bar.close()
+            self._phase_bar = None
+
+    def start_item(self, mp3_path: Path):
+        self._current_file = mp3_path.name
+        self._current_status = "queued"
+        self._refresh_tqdm_postfix()
+        self._log_plain_progress(force=True)
+
+    def set_status(self, mp3_path: Path | None, status: str):
+        self._current_file = mp3_path.name if mp3_path else self._current_file
+        self._current_status = status
+        self._refresh_tqdm_postfix()
+        self._log_plain_progress(force=True)
+
+    def complete_item(self, duration_seconds: float):
+        self._phase_done += 1
+        if duration_seconds >= 0:
+            self._phase_item_durations.append(duration_seconds)
+
+        if self._phase_bar is not None:
+            self._phase_bar.update(1)
+        self._refresh_tqdm_postfix()
+        self._log_plain_progress(force=True)
+
+    def start_cross_file(self, total_chunks: int):
+        if self.mode == "tqdm" and tqdm is not None:
+            if self._cross_bar is not None:
+                self._cross_bar.close()
+            self._cross_bar = tqdm(
+                total=max(0, total_chunks),
+                desc="Cross-file matching",
+                unit="chunk",
+                dynamic_ncols=True,
+            )
+        elif self.mode == "plain":
+            logger.info("Progress: cross-file chunks total=%d", total_chunks)
+            self._last_cross_plain_log = 0.0
+
+    def update_cross_file(self, chunks_done: int, chunks_total: int, comparisons: int, matches: int, elapsed: float):
+        if self._cross_bar is not None:
+            self._cross_bar.total = max(0, chunks_total)
+            self._cross_bar.n = max(0, chunks_done)
+            self._cross_bar.set_postfix({"cmp": comparisons, "matches": matches, "elapsed": f"{elapsed:.0f}s"}, refresh=False)
+            self._cross_bar.refresh()
+            if chunks_done >= chunks_total:
+                self._cross_bar.close()
+                self._cross_bar = None
+        elif self.mode == "plain":
+            now = time.monotonic()
+            if (now - self._last_cross_plain_log) < PROGRESS_PLAIN_LOG_INTERVAL_SECONDS and chunks_done < chunks_total:
+                return
+            self._last_cross_plain_log = now
+            logger.info(
+                "Progress: cross-file %d/%d chunks comparisons=%d matches=%d elapsed=%ss",
+                chunks_done,
+                chunks_total,
+                comparisons,
+                matches,
+                int(elapsed),
+            )
+
+    def _refresh_tqdm_postfix(self):
+        if self._phase_bar is None:
+            return
+        left = max(0, self._phase_total - self._phase_done)
+        eta_seconds: float | None = None
+        if self._phase_item_durations and left > 0:
+            eta_seconds = (sum(self._phase_item_durations) / len(self._phase_item_durations)) * left
+        self._phase_bar.set_postfix(
+            {
+                "left": left,
+                "eta": _format_duration(eta_seconds),
+                "current": _truncate_label(self._current_file),
+                "status": self._current_status,
+            },
+            refresh=False,
+        )
+        self._phase_bar.refresh()
+
+    def _log_plain_progress(self, force: bool = False):
+        if self.mode != "plain":
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_plain_log) < PROGRESS_PLAIN_LOG_INTERVAL_SECONDS:
+            return
+        self._last_plain_log = now
+
+        left = max(0, self._phase_total - self._phase_done)
+        elapsed = now - self._phase_started_at if self._phase_started_at else 0.0
+        eta_seconds: float | None = None
+        if self._phase_item_durations and left > 0:
+            eta_seconds = (sum(self._phase_item_durations) / len(self._phase_item_durations)) * left
+
+        logger.info(
+            "Progress: phase=%s done=%d/%d left=%d elapsed=%s eta=%s current=%s status=%s",
+            self._phase_name,
+            self._phase_done,
+            self._phase_total,
+            left,
+            _format_duration(elapsed),
+            _format_duration(eta_seconds),
+            self._current_file,
+            self._current_status,
+        )
+
+    def close(self):
+        self.finish_phase()
+        if self._cross_bar is not None:
+            self._cross_bar.close()
+            self._cross_bar = None
 
 
 def utc_now_iso() -> str:
@@ -33,13 +286,6 @@ def save_json_atomic(path: Path, payload: dict | list):
     tmp_path.replace(path)
 
 
-def get_global_patterns_path() -> Path:
-    env_path = os.environ.get("PODSPONSOR_GLOBAL_PATTERNS")
-    if env_path:
-        return Path(env_path)
-    return Path.home() / ".podsponsor" / "ads.json"
-
-
 class PodsponsorConfig:
     def __init__(self, config_path: str):
         with open(config_path, "r", encoding="utf-8") as f:
@@ -50,22 +296,62 @@ class PodsponsorConfig:
         self.w_device = self.data.get("whisper", {}).get("device", "cuda")
         self.w_compute = self.data.get("whisper", {}).get("compute_type", "float16")
         self.w_batch_size = int(self.data.get("whisper", {}).get("batch_size", 16))
+        self.w_chunk_size = int(self.data.get("whisper", {}).get("chunk_size", 20))
 
         # LLM settings
         llm = self.data.get("llm", {})
         self.summary_lang = llm.get("summary_language", "en")
-        
+
         default_prompt = (
-            "You are an expert podcast analyst. Your job is to identify sponsor ad reads and generate a detailed, structured summary of the episode.\n"
-            "The episode summary must strictly be written in {summary_language}.\n\n"
-            
-            "Format the summary using clear markdown sections and bullet points. Include the following sections:\n"
-            "- **Main Topics Discussed**: Core subjects covered in the episode.\n"
-            "- **Key Takeaways & Ideas**: The most important concepts, mental models, or actionable advice (focus on what is worth remembering; ignore casual banter).\n"
-            "- **References & Resources**: Any books, articles, people, tools, or other media mentioned.\n\n"
-            
-            "Here are the transcribed audio segments. Each segment has an ID. Some segments are marked with [REPEATED].\n"
-            "Return the detected ad blocks with their starting and ending segment indices."
+            "You are an expert podcast analyst.\n"
+            "You must do two things:\n"
+            "1) Identify sponsor/ad-read blocks in the transcript.\n"
+            "2) Write a strict, useful episode summary.\n\n"
+            "Language rules:\n"
+            "- The entire episode summary must be written strictly in {summary_language} (including headings).\n"
+            "- Keep emojis and heading levels exactly as specified below.\n\n"
+            "Summary rules (very important):\n"
+            "- The summary must NOT mention sponsors, ads, discount codes, promo segments, host promos, calls-to-action, or housekeeping.\n"
+            "- Exclude intros/outros and any ad-read content from the summary.\n"
+            "- Do not include timestamps, timecodes, or segment indices like [12].\n"
+            "- Only include factual information present in the transcript. If unsure, omit it.\n"
+            "- No filler, no speculation, no commentary about being an AI, no meta about the transcript.\n\n"
+            "The `summary` field MUST be valid Markdown and MUST follow this exact structure.\n"
+            "Translate the words after the emoji into {summary_language}, but keep the emojis and heading levels the same.\n"
+            "Required sections: Title, Overview, Topics (>= 1 topic), Key Takeaways.\n"
+            "Optional sections: References Mentioned. Omit optional sections entirely if nothing is mentioned.\n"
+            "\n"
+            "Structure:\n"
+            "# 🎧 <Episode Summary Title>\n"
+            "## 🧭 <Overview>\n"
+            "- <1-4 bullets: what this episode is about>\n"
+            "## 🧩 <Topics>\n"
+            "### <Topic 1>\n"
+            "- <2-5 bullets: concrete points, claims, examples>\n"
+            "### <Topic 2>\n"
+            "- <2-5 bullets>\n"
+            "## 🧠 <Key Takeaways>\n"
+            "- <3-8 bullets: actionable ideas, mental models>\n"
+            "## 📚 <References Mentioned>\n"
+            "- 📖 <Book Title> — <Author if mentioned>\n"
+            "- 🎬 <Film/Series Title>\n"
+            "- 👤 <Person Name> — <Why they matter in context>\n"
+            "- 🛠️ <Tool/Project Name> — <What it is used for>\n"
+            "- 🔗 <Other resource worth looking up>\n"
+            "\n"
+            "Transcript format:\n"
+            "- You will receive transcribed audio segments. Each segment has an ID like [0].\n"
+            "- Some segments are marked with [REPEATED]. These are strong hints for pre-recorded ads/promos/intro/outro.\n\n"
+            "- Some segments are marked with [HIGH_FREQ]. This means segment frequency >= 3 across episodes.\n\n"
+            "Ad detection instructions:\n"
+            "1) Treat [REPEATED] segments as high-signal ad/promos.\n"
+            "2) Mark a segment as ad only when more than 50% of that segment is ad/promo content.\n"
+            "3) If only a small part of a segment is ad and most of it is regular podcast content, do NOT mark that segment as ad.\n"
+            "4) Even if a segment does not look ad-like on wording alone, if it is long enough (about 2-3 sentences) and marked [HIGH_FREQ], increase ad likelihood.\n"
+            "5) Expand slightly before/after [REPEATED] to capture the full natural boundary of the ad read.\n"
+            "6) Look for transitions like \"This episode is brought to you by...\", promo codes, URLs, or product pitches.\n"
+            "7) Group contiguous ad segments into a single block.\n"
+            "Return detected ad blocks with their starting and ending segment indices (and confidence)."
         )
         self.prompt_template = llm.get("prompt", default_prompt)
         
@@ -87,21 +373,115 @@ class PodsponsorConfig:
         self.min_confidence = float(detection.get("min_confidence", 0.70))
         self.min_ad_duration = float(detection.get("min_ad_duration", 8.0))
 
-        # Processing (Output Scheme)
-        processing = self.data.get("processing", {})
-        self.output_scheme = processing.get("output_scheme", "overwrite_with_backup")
-        # Legacy fallback
-        if "replace_original" in processing:
-            if processing.get("replace_original"):
-                self.output_scheme = "overwrite_with_backup" if processing.get("backup_original") else "overwrite_no_backup"
-            else:
-                self.output_scheme = "save_as_clean"
-                
-        self.manifest_name = processing.get("manifest_name", ".podsponsor-manifest.json")
-        self.local_ads_name = processing.get("local_ads_name", "ads.json")
+        # Backup settings
+        backup = self.data.get("backup", {})
+        self.backup_enabled = bool(backup.get("enabled", True))
+        backup_location = backup.get("location", "backup")
+        self.backup_location = str(backup_location or "backup").strip() or "backup"
+
+SIDECAR_VERSION = 2
 
 
+def sidecar_path_for_mp3(mp3_path: Path) -> Path:
+    return mp3_path.with_name(f"{mp3_path.stem}.podsponsor.json")
 
+
+def _to_float(value: Any, fallback: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _to_int(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+def default_sidecar(config: PodsponsorConfig) -> dict:
+    return {
+        "version": SIDECAR_VERSION,
+        "status": "new",
+        "processing_info": {
+            "processed_at": None,
+            "processing_time_seconds": None,
+            "transcription_language": None,
+            "whisper_model": str(config.w_model),
+        },
+        "backup_path": None,
+        "backup_srt_path": None,
+        "ad_blocks": [],
+        "original_segments": [],
+    }
+
+
+def normalize_sidecar(sidecar: dict | None, config: PodsponsorConfig) -> dict:
+    if not isinstance(sidecar, dict):
+        sidecar = {}
+
+    normalized = default_sidecar(config)
+    normalized["version"] = _to_int(sidecar.get("version", SIDECAR_VERSION), SIDECAR_VERSION)
+
+    status = sidecar.get("status")
+    if status in {"new", "transcripted", "success"}:
+        normalized["status"] = status
+
+    processing_info = sidecar.get("processing_info")
+    if isinstance(processing_info, dict):
+        normalized["processing_info"].update(
+            {
+                "processed_at": processing_info.get("processed_at"),
+                "processing_time_seconds": processing_info.get("processing_time_seconds"),
+                "transcription_language": processing_info.get("transcription_language"),
+                "whisper_model": processing_info.get("whisper_model") or normalized["processing_info"]["whisper_model"],
+            }
+        )
+
+    backup_path = sidecar.get("backup_path")
+    if isinstance(backup_path, str):
+        normalized["backup_path"] = backup_path
+
+    backup_srt_path = sidecar.get("backup_srt_path")
+    if isinstance(backup_srt_path, str):
+        normalized["backup_srt_path"] = backup_srt_path
+
+    ad_blocks = sidecar.get("ad_blocks")
+    if isinstance(ad_blocks, list):
+        normalized_blocks: List[dict] = []
+        for block in ad_blocks:
+            if not isinstance(block, dict):
+                continue
+            normalized_blocks.append(
+                {
+                    "start": _to_float(block.get("start")),
+                    "end": _to_float(block.get("end")),
+                    "text": str(block.get("text", "")),
+                    "confidence": _to_float(block.get("confidence")),
+                    "frequency": _to_int(block.get("frequency")),
+                    "source": str(block.get("source", "llm")),
+                }
+            )
+        normalized["ad_blocks"] = normalized_blocks
+
+    # Support old "segments" key or new "original_segments"
+    segments = sidecar.get("original_segments") or sidecar.get("segments")
+    if isinstance(segments, list):
+        normalized_segments: List[dict] = []
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            normalized_segments.append(
+                {
+                    "start": _to_float(seg.get("start")),
+                    "end": _to_float(seg.get("end")),
+                    "text": str(seg.get("text", "")),
+                    "frequency": _to_int(seg.get("frequency")),
+                }
+            )
+        normalized["original_segments"] = normalized_segments
+
+    return normalized
 
 
 def check_silence(input_path: Path, threshold_db: int = -40, duration_sec: float = 1.5) -> List[Tuple[float, float]]:
@@ -141,203 +521,6 @@ def check_silence(input_path: Path, threshold_db: int = -40, duration_sec: float
     return intervals
 
 
-def load_patterns(path: Path) -> List[str]:
-    if not path.exists():
-        return []
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Could not load pattern file %s: %s", path, exc)
-        return []
-
-    if isinstance(raw, list):
-        return [item for item in raw if isinstance(item, str)]
-
-    if isinstance(raw, dict):
-        values = raw.get("patterns", [])
-        if isinstance(values, list):
-            return [item for item in values if isinstance(item, str)]
-
-    logger.warning("Pattern file has unsupported format: %s", path)
-    return []
-
-
-class PatternStore:
-    def __init__(self, show_dir: Path, local_name: str):
-        self.local_path = show_dir / local_name
-        self.global_path = get_global_patterns_path()
-
-        self.local_patterns = load_patterns(self.local_path)
-        self.global_patterns = load_patterns(self.global_path)
-
-        self._local_set = set(self.local_patterns)
-        self._global_set = set(self.global_patterns)
-
-        # Pre-compute normalized texts and trigrams for fast matching
-        self._local_normalized = [p.strip().lower() for p in self.local_patterns]
-        self._global_normalized = [p.strip().lower() for p in self.global_patterns]
-        self._local_trigrams = [self._make_trigrams(p) for p in self._local_normalized]
-        self._global_trigrams = [self._make_trigrams(p) for p in self._global_normalized]
-
-    @staticmethod
-    def _make_trigrams(text: str) -> Set[str]:
-        return set(text[i:i+3] for i in range(max(1, len(text) - 2)))
-
-    def is_known_ad(self, text: str, threshold: float) -> bool:
-        t1 = text.strip().lower()
-        if len(t1) < 20:
-            return False
-
-        t1_trigrams = self._make_trigrams(t1)
-
-        for pattern, tri in zip(self._local_normalized, self._local_trigrams):
-            # Quick trigram overlap check before expensive SequenceMatcher
-            min_tri = min(len(t1_trigrams), len(tri))
-            if min_tri > 0 and len(t1_trigrams & tri) / min_tri < 0.3:
-                continue
-            if SequenceMatcher(None, t1, pattern).ratio() > threshold:
-                return True
-
-        for pattern, tri in zip(self._global_normalized, self._global_trigrams):
-            min_tri = min(len(t1_trigrams), len(tri))
-            if min_tri > 0 and len(t1_trigrams & tri) / min_tri < 0.3:
-                continue
-            if SequenceMatcher(None, t1, pattern).ratio() > threshold:
-                return True
-
-        return False
-
-    def add_pattern(self, text: str):
-        cleaned = text.strip()
-        if len(cleaned) <= 30:
-            return
-
-        local_changed = False
-        global_changed = False
-
-        if cleaned not in self._local_set:
-            self._local_set.add(cleaned)
-            self.local_patterns.append(cleaned)
-            local_changed = True
-
-        if cleaned not in self._global_set:
-            self._global_set.add(cleaned)
-            self.global_patterns.append(cleaned)
-            global_changed = True
-
-        if local_changed:
-            self._local_normalized.append(cleaned.lower())
-            self._local_trigrams.append(self._make_trigrams(cleaned.lower()))
-            save_json_atomic(self.local_path, self.local_patterns)
-
-        if global_changed:
-            self._global_normalized.append(cleaned.lower())
-            self._global_trigrams.append(self._make_trigrams(cleaned.lower()))
-            save_json_atomic(self.global_path, self.global_patterns)
-
-
-class GlobalPatternDB:
-    def __init__(self):
-        self.path = get_global_patterns_path()
-        self.patterns = load_patterns(self.path)
-
-    def save(self):
-        save_json_atomic(self.path, self.patterns)
-
-
-class ManifestStore:
-    def __init__(self, show_dir: Path, manifest_name: str):
-        self.path = show_dir / manifest_name
-        self.data = {"version": 1, "files": {}}
-        self._load()
-
-    def _load(self):
-        if not self.path.exists():
-            return
-
-        try:
-            with open(self.path, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("Could not load manifest %s: %s", self.path, exc)
-            return
-
-        if isinstance(loaded, dict) and isinstance(loaded.get("files"), dict):
-            self.data = loaded
-        else:
-            logger.warning("Manifest has invalid format, ignoring: %s", self.path)
-
-    def save(self):
-        save_json_atomic(self.path, self.data)
-
-    def fingerprint(self, mp3_path: Path) -> Dict[str, int]:
-        stat = mp3_path.stat()
-        return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-
-    def get_entry(self, mp3_path: Path) -> dict:
-        return dict(self.data.setdefault("files", {}).get(mp3_path.name, {}))
-
-    def should_skip(self, mp3_path: Path, force: bool = False) -> bool:
-        if force:
-            return False
-
-        entry = self.get_entry(mp3_path)
-        if not entry:
-            return False
-
-        return entry.get("status") == "success" and entry.get("fingerprint") == self.fingerprint(mp3_path)
-
-    def mark_processing(self, mp3_path: Path, stage: str, fingerprint: Dict[str, int], used_srt_cache: bool = False):
-        files = self.data.setdefault("files", {})
-        files[mp3_path.name] = {
-            "status": "processing",
-            "stage": stage,
-            "fingerprint": fingerprint,
-            "used_srt_cache": used_srt_cache,
-            "last_error": "",
-            "updated_at": utc_now_iso(),
-        }
-        save_json_atomic(self.path, self.data)
-
-    def mark_failed(
-        self,
-        mp3_path: Path,
-        stage: str,
-        fingerprint: Dict[str, int],
-        error: str,
-        used_srt_cache: bool = False,
-    ):
-        files = self.data.setdefault("files", {})
-        files[mp3_path.name] = {
-            "status": "failed",
-            "stage": stage,
-            "fingerprint": fingerprint,
-            "used_srt_cache": used_srt_cache,
-            "last_error": error,
-            "updated_at": utc_now_iso(),
-        }
-        save_json_atomic(self.path, self.data)
-
-    def mark_success(self, mp3_path: Path, fingerprint: Dict[str, int], ad_blocks: List[Dict[str, float]] = None):
-        files = self.data.setdefault("files", {})
-        
-        entry = {
-            "status": "success",
-            "stage": "done",
-            "fingerprint": fingerprint,
-            "last_error": "",
-            "updated_at": utc_now_iso(),
-        }
-        
-        if ad_blocks is not None:
-            entry["ad_blocks"] = ad_blocks
-
-        files[mp3_path.name] = entry
-        save_json_atomic(self.path, self.data)
-
-
 # --- Transcriber ---
 class Transcriber:
     def __init__(self, config: PodsponsorConfig):
@@ -345,11 +528,15 @@ class Transcriber:
         self._model = None
         
         # Suppress aggressive Pyannote warnings about TF32
-        import torch
-        import warnings
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
+        try:
+            import torch
+            import warnings
+
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            warnings.filterwarnings("ignore", category=UserWarning, module="pyannote")
+        except ImportError:
+            pass
 
     def transcribe(self, audio_path: Path, language: str | None = None) -> dict:
         import whisperx
@@ -365,7 +552,18 @@ class Transcriber:
 
         audio = whisperx.load_audio(str(audio_path))
         logger.info("Transcribing %s...", audio_path.name)
-        result = self._model.transcribe(audio, batch_size=self.config.w_batch_size, language=language)
+        try:
+            result = self._model.transcribe(
+                audio,
+                batch_size=self.config.w_batch_size,
+                language=language,
+                chunk_size=self.config.w_chunk_size,
+            )
+        except TypeError:
+            logger.warning(
+                "WhisperX runtime does not accept chunk_size; using legacy transcribe call without chunk_size."
+            )
+            result = self._model.transcribe(audio, batch_size=self.config.w_batch_size, language=language)
         return result
 
 
@@ -388,36 +586,6 @@ def save_srt(segments: List[dict], filepath: Path):
             f.write(f"{idx}\n")
             f.write(f"{format_srt_ts(segment['start'])} --> {format_srt_ts(segment['end'])}\n")
             f.write(f"{segment['text'].strip()}\n\n")
-
-
-
-
-# --- Words JSON ---
-def save_words_json(segments: List[dict], filepath: Path):
-    """Save full segment data including word-level timings."""
-    serializable = []
-    for seg in segments:
-        entry = {"start": seg["start"], "end": seg["end"], "text": seg.get("text", "")}
-        if "words" in seg:
-            entry["words"] = seg["words"]
-        serializable.append(entry)
-    save_json_atomic(filepath, serializable)
-
-
-def load_words_json(filepath: Path) -> List[dict]:
-    """Load segments with word-level timings from .words.json."""
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("Could not load words JSON %s: %s", filepath, exc)
-        return []
-
-    if not isinstance(data, list):
-        return []
-
-    return data
-
 
 # --- Cross-File Matching ---
 
@@ -485,6 +653,7 @@ def find_repeated_segments(
     new_targets: Set[Path],
     sim_threshold: float,
     load_all_segments_func=None,
+    fuzzy_progress_callback: FuzzyProgressCallback | None = None,
 ) -> Dict[Path, Set[int]]:
     """Find segments that appear in multiple files (likely ads).
 
@@ -596,30 +765,74 @@ def find_repeated_segments(
         chunks.append((idx, min(idx + chunk_size, n)))
         idx += chunk_size
 
-    logger.info("Cross-file matching: spawning %d processes across %d chunks...", num_cores, len(chunks))
+    if fuzzy_progress_callback is not None:
+        fuzzy_progress_callback(
+            {
+                "chunks_done": 0,
+                "chunks_total": len(chunks),
+                "comparisons": fuzzy_comparisons,
+                "matches": fuzzy_matches,
+                "elapsed": 0.0,
+            }
+        )
 
-    fork_ctx = multiprocessing.get_context("fork")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores, mp_context=fork_ctx) as executor:
-        futures = {executor.submit(_process_fuzzy_chunk, start_i, end_i): (start_i, end_i) for start_i, end_i in chunks}
-        
+    def _update_fuzzy_progress(chunks_done: int):
+        nonlocal last_log, fuzzy_comparisons, fuzzy_matches
+        now = time.time()
+        if fuzzy_progress_callback is not None:
+            fuzzy_progress_callback(
+                {
+                    "chunks_done": chunks_done,
+                    "chunks_total": len(chunks),
+                    "comparisons": fuzzy_comparisons,
+                    "matches": fuzzy_matches,
+                    "elapsed": now - t3,
+                }
+            )
+        if now - last_log >= 30 or chunks_done == len(chunks):
+            elapsed = now - t3
+            logger.info(
+                "Cross-file matching: fuzzy progress %d/%d chunks (%.0f%%) — %d comparisons, %d matches, %.0fs elapsed",
+                chunks_done, len(chunks), 100 * chunks_done / len(chunks),
+                fuzzy_comparisons, fuzzy_matches, elapsed
+            )
+            last_log = now
+
+    fork_ctx = None
+    try:
+        fork_ctx = multiprocessing.get_context("fork")
+    except (ValueError, AttributeError):
+        logger.warning(
+            "Cross-file matching: 'fork' multiprocessing context is unavailable on this platform; "
+            "falling back to in-process fuzzy matching (slower)."
+        )
+
+    if fork_ctx is None:
+        logger.info("Cross-file matching: running in-process across %d chunks...", len(chunks))
         chunks_done = 0
-        for future in concurrent.futures.as_completed(futures):
-            comps, mats, susp_pairs = future.result()
+        for start_i, end_i in chunks:
+            comps, mats, susp_pairs = _process_fuzzy_chunk(start_i, end_i)
             fuzzy_comparisons += comps
             fuzzy_matches += mats
             for fp, susp_idx in susp_pairs:
                 suspicious[fp].add(susp_idx)
-            
             chunks_done += 1
-            now = time.time()
-            if now - last_log >= 30 or chunks_done == len(chunks):
-                elapsed = now - t3
-                logger.info(
-                    "Cross-file matching: fuzzy progress %d/%d chunks (%.0f%%) — %d comparisons, %d matches, %.0fs elapsed",
-                    chunks_done, len(chunks), 100 * chunks_done / len(chunks),
-                    fuzzy_comparisons, fuzzy_matches, elapsed
-                )
-                last_log = now
+            _update_fuzzy_progress(chunks_done)
+    else:
+        logger.info("Cross-file matching: spawning %d processes across %d chunks...", num_cores, len(chunks))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_cores, mp_context=fork_ctx) as executor:
+            futures = {executor.submit(_process_fuzzy_chunk, start_i, end_i): (start_i, end_i) for start_i, end_i in chunks}
+
+            chunks_done = 0
+            for future in concurrent.futures.as_completed(futures):
+                comps, mats, susp_pairs = future.result()
+                fuzzy_comparisons += comps
+                fuzzy_matches += mats
+                for fp, susp_idx in susp_pairs:
+                    suspicious[fp].add(susp_idx)
+
+                chunks_done += 1
+                _update_fuzzy_progress(chunks_done)
 
     t4 = time.time()
     total = sum(len(v) for v in suspicious.values())
@@ -638,16 +851,19 @@ def analyze_with_llm(
     config: PodsponsorConfig,
     segments: List[dict],
     suspicious_indices: Set[int],
-) -> dict:
+) -> Tuple[dict, dict]:
     from openai import OpenAI
 
     transcript_lines = []
     for i, segment in enumerate(segments):
         text = segment["text"].strip()
+        labels: List[str] = []
         if i in suspicious_indices:
-            transcript_lines.append(f"[{i}] [REPEATED] {text}")
-        else:
-            transcript_lines.append(f"[{i}] {text}")
+            labels.append("[REPEATED]")
+        if _to_int(segment.get("frequency", 0)) >= 3:
+            labels.append("[HIGH_FREQ]")
+        label_prefix = f"{' '.join(labels)} " if labels else ""
+        transcript_lines.append(f"[{i}] {label_prefix}{text}")
 
     transcript_text = "\n".join(transcript_lines)
     prompt = config.prompt_template.format(summary_language=config.summary_lang)
@@ -707,8 +923,30 @@ def analyze_with_llm(
             response_content = response.choices[0].message.content
             if not response_content:
                 raise ValueError("Empty response from LLM")
-                
-            return json.loads(response_content)
+
+            parsed = json.loads(response_content)
+            usage_raw = getattr(response, "usage", None)
+            usage = {
+                "prompt_tokens": _to_int(getattr(usage_raw, "prompt_tokens", 0)),
+                "completion_tokens": _to_int(getattr(usage_raw, "completion_tokens", 0)),
+                "total_tokens": _to_int(getattr(usage_raw, "total_tokens", 0)),
+            }
+            llm_response_payload = {
+                "provider": provider.get("base_url"),
+                "model": model,
+                "usage": usage,
+                "choices": [
+                    {
+                        "text": response_content,
+                        "index": _to_int(getattr(response.choices[0], "index", 0)),
+                        "logprobs": getattr(response.choices[0], "logprobs", None),
+                        "finish_reason": getattr(response.choices[0], "finish_reason", None),
+                    }
+                ],
+                "parsed": parsed,
+            }
+
+            return parsed, llm_response_payload
             
         except Exception as exc:
             logger.warning("LLM provider %s failed: %s", provider.get("base_url"), exc)
@@ -883,13 +1121,25 @@ def get_audio_duration(path: Path) -> float:
 
 # --- Processor Engine ---
 class Processor:
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, progress_callback: ProgressCallback | None = None):
         self.config = PodsponsorConfig(config_path)
         self.transcriber = Transcriber(self.config)
-        self.pattern_stores: Dict[Path, PatternStore] = {}
-        self.manifests: Dict[Path, ManifestStore] = {}
         self._show_languages: Dict[Path, str | None] = {}
+        self._sidecar_cache: Dict[Path, dict] = {}
         self._segments_mem_cache: Dict[Path, List[dict]] = {}
+        self._progress_callback = progress_callback
+
+    def _emit_progress(self, event: str, mp3_path: Path | None, **fields):
+        if event not in PROGRESS_EVENT_STATUSES:
+            return
+        if self._progress_callback is None:
+            return
+        try:
+            payload = dict(fields)
+            payload["event"] = event
+            self._progress_callback(event, mp3_path, payload)
+        except Exception as exc:  # pragma: no cover - defensive callback isolation
+            logger.debug("Progress callback failed: %s", exc)
 
     def _get_show_language(self, show_dir: Path) -> str | None:
         """Read language from metadata.json if present."""
@@ -908,60 +1158,130 @@ class Processor:
             self._show_languages[show_dir] = lang
         return self._show_languages[show_dir]
 
-    def _get_pattern_store(self, show_dir: Path) -> PatternStore:
-        if show_dir not in self.pattern_stores:
-            self.pattern_stores[show_dir] = PatternStore(show_dir, self.config.local_ads_name)
-        return self.pattern_stores[show_dir]
+    def _load_sidecar(self, mp3_path: Path) -> dict:
+        if mp3_path in self._sidecar_cache:
+            return self._sidecar_cache[mp3_path]
 
-    def _get_manifest(self, show_dir: Path) -> ManifestStore:
-        if show_dir not in self.manifests:
-            self.manifests[show_dir] = ManifestStore(show_dir, self.config.manifest_name)
-        return self.manifests[show_dir]
+        sidecar_path = sidecar_path_for_mp3(mp3_path)
+        raw: dict | None = None
+        if sidecar_path.exists():
+            try:
+                with open(sidecar_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Could not load sidecar %s: %s", sidecar_path.name, exc)
+
+        sidecar = normalize_sidecar(raw, self.config)
+        self._sidecar_cache[mp3_path] = sidecar
+
+        if not sidecar_path.exists():
+            save_json_atomic(sidecar_path, sidecar)
+
+        return sidecar
+
+    def _save_sidecar(self, mp3_path: Path):
+        save_json_atomic(sidecar_path_for_mp3(mp3_path), self._sidecar_cache[mp3_path])
+
+    def _ensure_sidecar(self, mp3_path: Path) -> dict:
+        return self._load_sidecar(mp3_path)
+
+    def _segments_for_storage(self, segments: List[dict]) -> List[dict]:
+        return [
+            {
+                "start": _to_float(seg.get("start")),
+                "end": _to_float(seg.get("end")),
+                "text": str(seg.get("text", "")),
+                "frequency": 0,
+            }
+            for seg in segments
+        ]
 
     def ensure_transcription(self, mp3_path: Path):
-        """Phase 1: Ensure .words.json (and .srt) exist for this file."""
-        words_path = mp3_path.with_suffix(".words.json")
+        """Phase 1: Ensure sidecar segments and .srt exist for this file."""
+        self._emit_progress("transcribing", mp3_path, phase="transcription")
+        sidecar = self._ensure_sidecar(mp3_path)
+        status = sidecar.get("status")
+        if status in {"transcripted", "success"} and (sidecar.get("original_segments") or sidecar.get("segments")):
+            logger.info("Segments exist in sidecar, skipping transcription: %s", mp3_path.name)
+            self._emit_progress("skipped", mp3_path, phase="transcription", reason="already_transcribed")
+            return
+
+        started_at = time.monotonic()
         srt_path = mp3_path.with_suffix(".srt")
-
-        if words_path.exists():
-            segments = load_words_json(words_path)
-            if segments:
-                logger.info("Word-level data exists, skipping transcription: %s", mp3_path.name)
-                return
-
-        # Need to transcribe (even if SRT exists, we need word-level data)
-        # However, to prevent partial states, if a legacy or orphaned .srt exists 
-        # but the .words.json is missing, we delete the .srt and force a clean run.
-        if srt_path.exists() and not words_path.exists():
-            logger.warning("Orphaned .srt found without .words.json. Deleting .srt to force clean sync: %s", srt_path.name)
-            try:
-                srt_path.unlink()
-            except OSError as exc:
-                logger.warning("Failed to delete orphaned .srt %s: %s", srt_path.name, exc)
-            
         language = self._get_show_language(mp3_path.parent)
         logger.info("Transcribing (full run): %s", mp3_path.name)
-        result = self.transcriber.transcribe(mp3_path, language=language)
-        segments = result.get("segments", [])
+        try:
+            result = self.transcriber.transcribe(mp3_path, language=language)
+        except Exception:
+            self._emit_progress("failed", mp3_path, phase="transcription", reason="transcribe_failed")
+            raise
+        segments = self._segments_for_storage(result.get("segments", []))
 
         if not segments:
             logger.warning("No segments produced for %s", mp3_path.name)
+            self._emit_progress("failed", mp3_path, phase="transcription", reason="no_segments")
             return
 
-        # Save both formats
-        save_words_json(segments, words_path)
+        sidecar["original_segments"] = segments
+        sidecar["status"] = "transcripted"
+        sidecar["ad_blocks"] = []
+        info = sidecar.setdefault("processing_info", {})
+        info["transcription_language"] = result.get("language") or language
+        info["whisper_model"] = str(self.config.w_model)
+        info["processed_at"] = None
+        info["processing_time_seconds"] = None
+        self._save_sidecar(mp3_path)
+
         save_srt(segments, srt_path)
-        logger.info("Saved word-level data and SRT for: %s", mp3_path.name)
+        logger.info("Saved sidecar segments and SRT for: %s", mp3_path.name)
+        self._emit_progress(
+            "transcribed",
+            mp3_path,
+            phase="transcription",
+            duration_seconds=time.monotonic() - started_at,
+            segments=len(segments),
+        )
+
+    def update_segment_frequencies(self, targets: List[Path]):
+        """Fill segment frequency using sidecars in transcripted/success statuses."""
+        text_to_files: Dict[str, Set[Path]] = defaultdict(set)
+        sidecars: Dict[Path, dict] = {}
+
+        for mp3_path in targets:
+            sidecar = self._ensure_sidecar(mp3_path)
+            sidecars[mp3_path] = sidecar
+            if sidecar.get("status") not in {"transcripted", "success"}:
+                continue
+            for seg in sidecar.get("original_segments", []):
+                normalized = seg.get("text", "").strip().lower()
+                if len(normalized) < 20:
+                    continue
+                text_to_files[normalized].add(mp3_path)
+
+        for mp3_path in targets:
+            sidecar = sidecars[mp3_path]
+            if sidecar.get("status") != "transcripted":
+                continue
+
+            changed = False
+            for seg in sidecar.get("original_segments", []):
+                normalized = seg.get("text", "").strip().lower()
+                freq = len(text_to_files.get(normalized, set())) if len(normalized) >= 20 else 0
+                if seg.get("frequency") != freq:
+                    seg["frequency"] = freq
+                    changed = True
+
+            if changed:
+                self._save_sidecar(mp3_path)
 
     def preload_all_segments(self, targets: List[Path]):
-        """Preload all segment files into memory sequentially."""
+        """Preload all sidecar segments into memory sequentially."""
         logger.info("Pre-loading segments into memory sequentially...")
         for mp3_path in targets:
-            words_path = mp3_path.with_suffix(".words.json")
-            if words_path.exists():
-                segments = load_words_json(words_path)
-                if segments:
-                    self._segments_mem_cache[mp3_path] = segments
+            sidecar = self._ensure_sidecar(mp3_path)
+            original_segments = sidecar.get("original_segments", [])
+            if original_segments:
+                self._segments_mem_cache[mp3_path] = original_segments
             
         logger.info("Pre-loaded %d segment files into memory.", len(self._segments_mem_cache))
 
@@ -973,174 +1293,202 @@ class Processor:
                 all_segments[mp3_path] = self._segments_mem_cache[mp3_path]
         return all_segments
 
-    def get_exact_word_timing(self, segment: dict, boundary: str) -> float:
-        """Get precise start/end time from WhisperX word timings when available."""
-        words = segment.get("words", [])
-        if not words:
-            return float(segment[boundary])
-
-        valid_words = [w for w in words if "start" in w and "end" in w]
-        if not valid_words:
-            return float(segment[boundary])
-
-        if boundary == "start":
-            return float(valid_words[0]["start"])
-        return float(valid_words[-1]["end"])
-
-    def process_file(self, mp3_path: Path, suspicious: Set[int], force: bool = False, dry_run: bool = False) -> str:
-        """Phase 2: Detect ads and cut audio for a single file."""
-        manifest = self._get_manifest(mp3_path.parent)
-        pattern_store = self._get_pattern_store(mp3_path.parent)
-        fingerprint = manifest.fingerprint(mp3_path)
+    def _save_summary(self, mp3_path: Path, summary: str):
         md_path = mp3_path.with_suffix(".md")
-        words_path = mp3_path.with_suffix(".words.json")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(summary)
+        logger.info("Saved Summary: %s", md_path.name)
 
-        if manifest.should_skip(mp3_path, force=force):
+    def _derive_ad_blocks(
+        self,
+        mp3_path: Path,
+        segments: List[dict],
+        parsed_blocks: List[Tuple[int, int, float]],
+    ) -> List[dict]:
+        if not parsed_blocks:
+            return []
+
+        confidence_by_index: Dict[int, float] = {}
+        all_ad_indices: set[int] = set()
+        for start, end, confidence in parsed_blocks:
+            for idx in range(start, end + 1):
+                all_ad_indices.add(idx)
+                confidence_by_index[idx] = max(confidence_by_index.get(idx, 0.0), confidence)
+
+        silences = check_silence(mp3_path, self.config.silence_db, self.config.silence_min_dur)
+        blocks = group_contiguous(sorted(all_ad_indices))
+        final_ad_blocks: List[dict] = []
+
+        for block in blocks:
+            start_seg = segments[block[0]]
+            end_seg = segments[block[-1]]
+
+            seg_start = _to_float(start_seg.get("start"))
+            seg_end = _to_float(end_seg.get("end"))
+
+            if (seg_end - seg_start) < self.config.min_ad_duration:
+                logger.info(
+                    "Dropping short ad block (%.1fs < %.1fs): segments %d-%d",
+                    seg_end - seg_start,
+                    self.config.min_ad_duration,
+                    block[0],
+                    block[-1],
+                )
+                continue
+
+            final_start = seg_start
+            final_end = seg_end
+
+            for silence_start, silence_end in silences:
+                if silence_end < final_start and (final_start - silence_end) < 15.0:
+                    final_start = silence_end
+
+            for silence_start, silence_end in silences:
+                if silence_start > final_end:
+                    if (silence_start - final_end) < 15.0:
+                        final_end = silence_start
+                    break
+
+            ad_text = " ".join(segments[i].get("text", "") for i in block).strip()
+            block_confidence = max(confidence_by_index.get(i, 0.0) for i in block)
+            block_frequency = min(_to_int(segments[i].get("frequency", 0)) for i in block)
+
+            logger.info(
+                "Ad found at %.2fs - %.2fs (segments %d-%d)",
+                seg_start,
+                seg_end,
+                block[0],
+                block[-1],
+            )
+            logger.info("  Snapping to silence: %.2fs - %.2fs", final_start, final_end)
+            final_ad_blocks.append(
+                {
+                    "start": final_start,
+                    "end": final_end,
+                    "text": ad_text,
+                    "confidence": block_confidence,
+                    "frequency": block_frequency,
+                    "source": "llm",
+                }
+            )
+
+        return final_ad_blocks
+
+    def process_file(self, mp3_path: Path, suspicious: Set[int], force: bool = False, dry_run: bool = False, update: bool = False) -> str:
+        """Phase 2: Detect ads and cut audio for a single file."""
+        self._emit_progress("queued", mp3_path, phase="detection")
+        sidecar = self._ensure_sidecar(mp3_path)
+        is_success = sidecar.get("status") == "success"
+
+        if is_success and not force and not update:
             logger.info("Skipping already processed file: %s", mp3_path.name)
+            self._emit_progress("skipped", mp3_path, phase="detection", reason="already_success")
             return "skipped"
 
-        stage = "load"
+        if sidecar.get("status") == "new":
+            logger.warning("Skipping file with status=new (transcription missing): %s", mp3_path.name)
+            self._emit_progress("skipped", mp3_path, phase="detection", reason="missing_transcription")
+            return "skipped"
 
-        try:
-            # Load segments from memory cache or disk
-            segments = self._segments_mem_cache.get(mp3_path)
+        started_at = time.monotonic()
+        # Use renamed "original_segments" key
+        segments = self._segments_mem_cache.get(mp3_path) or sidecar.get("original_segments", [])
+        if not segments:
+            self._emit_progress("failed", mp3_path, phase="detection", reason="missing_segments")
+            raise RuntimeError(f"No sidecar segments found for {mp3_path.name}")
+
+        final_ad_blocks: List[dict]
+
+        if update and is_success:
+            logger.info("Updating from backup for: %s", mp3_path.name)
+            # Restore from backup
+            backup_path = sidecar.get("backup_path")
+            backup_srt_path = sidecar.get("backup_srt_path")
+            if not backup_path or not os.path.exists(backup_path):
+                raise RuntimeError(f"Cannot update: backup_path missing or not found for {mp3_path.name}")
             
-            if not segments:
-                segments = load_words_json(words_path)
-                
-            if not segments:
-                raise RuntimeError(f"No word-level data found for {mp3_path.name}")
+            if not dry_run:
+                shutil.copy2(backup_path, mp3_path)
+                if backup_srt_path and os.path.exists(backup_srt_path):
+                    shutil.copy2(backup_srt_path, mp3_path.with_suffix(".srt"))
+            
+            final_ad_blocks = sidecar.get("ad_blocks", [])
+        else:
+            freq_indices = {idx for idx, seg in enumerate(segments) if _to_int(seg.get("frequency", 0)) > 1}
+            all_suspicious = suspicious | freq_indices
 
-            # Combine suspicious indices with PatternStore matches
-            known_ad_indices = {
-                i for i, seg in enumerate(segments)
-                if pattern_store.is_known_ad(seg.get("text", ""), self.config.sim_thresh)
-            }
-            all_suspicious = suspicious | known_ad_indices
-
-            # LLM analysis
-            stage = "llm"
-            manifest.mark_processing(mp3_path, stage, fingerprint)
             try:
-                llm_response = analyze_with_llm(self.config, segments, all_suspicious)
+                self._emit_progress("analyzing_llm", mp3_path, phase="detection")
+                parsed, llm_payload = analyze_with_llm(self.config, segments, all_suspicious)
             except Exception as exc:
-                manifest.mark_failed(mp3_path, stage, fingerprint, str(exc))
                 logger.error("LLM failed for %s: %s", mp3_path.name, exc)
-                return "failed"
+                self._emit_progress("failed", mp3_path, phase="detection", reason="llm_failed")
+                return "skipped"
+            
+            parsed_summary = str(parsed.get("summary", ""))
+            self._save_summary(mp3_path, parsed_summary)
 
-            # Save summary
-            summary = llm_response.get("summary", "")
-            with open(md_path, "w", encoding="utf-8") as f:
-                f.write(summary)
-            logger.info("Saved Summary: %s", md_path.name)
-
-            # Parse ad blocks with confidence filter
-            ad_blocks = parse_llm_ad_blocks(
-                llm_response.get("ads", []),
+            parsed_blocks = parse_llm_ad_blocks(
+                parsed.get("ads", []),
                 max_index=len(segments),
                 min_confidence=self.config.min_confidence,
             )
+            self._emit_progress("deriving_ad_blocks", mp3_path, phase="detection")
+            final_ad_blocks = self._derive_ad_blocks(mp3_path, segments, parsed_blocks)
 
-            if not ad_blocks:
-                logger.info("No ads detected (after confidence filter). Skipping cut.")
-                if not dry_run:
-                    manifest.mark_success(mp3_path, fingerprint)
-                return "processed"
+            sidecar["ad_blocks"] = final_ad_blocks
+            self._save_sidecar(mp3_path)
 
-            # Collect ad segment indices directly from LLM blocks
-            all_ad_indices: set[int] = set()
-            for start, end, _ in ad_blocks:
-                for i in range(start, end + 1):
-                    all_ad_indices.add(i)
-
-            # Group into contiguous blocks
-            sorted_indices = sorted(all_ad_indices)
-            blocks = group_contiguous(sorted_indices)
-
-            # Build cut regions with word-level precision
-            silences = check_silence(mp3_path, self.config.silence_db, self.config.silence_min_dur)
-            total_duration = get_audio_duration(mp3_path)
-            cut_regions: List[Tuple[float, float]] = []
-            final_ad_blocks: List[Dict[str, float]] = []
-
-            for block in blocks:
-                start_seg = segments[block[0]]
-                end_seg = segments[block[-1]]
-
-                # Store ad text as pattern for future matching
-                ad_text = " ".join(segments[i].get("text", "") for i in block)
-                pattern_store.add_pattern(ad_text)
-
-                w_start = self.get_exact_word_timing(start_seg, "start")
-                w_end = self.get_exact_word_timing(end_seg, "end")
-
-                # Min duration filter
-                if (w_end - w_start) < self.config.min_ad_duration:
-                    logger.info("Dropping short ad block (%.1fs < %.1fs): segments %d-%d",
-                                w_end - w_start, self.config.min_ad_duration, block[0], block[-1])
-                    continue
-
-                final_start = w_start
-                final_end = w_end
-
-                # Snap to silence boundaries
-                for silence_start, silence_end in silences:
-                    if silence_end < final_start and (final_start - silence_end) < 15.0:
-                        final_start = silence_end
-
-                for silence_start, silence_end in silences:
-                    if silence_start > final_end:
-                        if (silence_start - final_end) < 15.0:
-                            final_end = silence_start
-                        break
-
-                logger.info("Ad found at %.2fs - %.2fs (segments %d-%d)", w_start, w_end, block[0], block[-1])
-                logger.info("  Snapping to silence: %.2fs - %.2fs", final_start, final_end)
-                cut_regions.append((final_start, final_end))
-                final_ad_blocks.append({
-                    "start": final_start,
-                    "end": final_end,
-                    "text": ad_text
-                })
-
-            if not cut_regions:
-                logger.info("No ad regions survived filtering. Skipping cut.")
-                if not dry_run:
-                    manifest.mark_success(mp3_path, fingerprint)
-                return "processed"
-
-            # Safety guardrail: if total ad time > 50% of episode, skip
-            total_ad_time = sum(end - start for start, end in cut_regions)
-            ad_ratio = total_ad_time / total_duration if total_duration > 0 else 0
-            if ad_ratio > 0.50:
-                logger.warning(
-                    "SAFETY: Ad time (%.1fs) is %.0f%% of episode (%.1fs) — skipping cut for %s",
-                    total_ad_time, ad_ratio * 100, total_duration, mp3_path.name,
-                )
-                if not dry_run:
-                    manifest.mark_failed(mp3_path, "safety", fingerprint, f"Ad ratio too high: {ad_ratio:.2f}")
-                return "failed"
-
-            if dry_run:
-                logger.info("DRY RUN: Would cut %.1fs of ads (%.0f%% of %.1fs) from %s",
-                            total_ad_time, ad_ratio * 100, total_duration, mp3_path.name)
-                for region_start, region_end in cut_regions:
-                    logger.info("  Would cut: %.2fs - %.2fs (%.1fs)", region_start, region_end, region_end - region_start)
-                return "processed"
-
-            # Cut audio
-            stage = "cut"
-            manifest.mark_processing(mp3_path, stage, fingerprint)
-            self._cut_audio(mp3_path, cut_regions, segments)
-            manifest.mark_success(mp3_path, fingerprint, ad_blocks=final_ad_blocks)
+        if not final_ad_blocks:
+            logger.info("No ads detected (after confidence filter). Skipping cut.")
+            if not dry_run:
+                sidecar["status"] = "success"
+                sidecar["processing_info"]["processed_at"] = utc_now_iso()
+                sidecar["processing_info"]["processing_time_seconds"] = time.monotonic() - started_at
+                sidecar["backup_path"] = None
+                self._save_sidecar(mp3_path)
+            self._emit_progress("processed", mp3_path, phase="detection", reason="no_ads")
             return "processed"
 
-        except Exception as exc:
-            manifest.mark_failed(mp3_path, stage, fingerprint, str(exc))
-            logger.error("Failed processing %s at stage %s: %s", mp3_path.name, stage, exc)
-            return "failed"
+        cut_regions = [(_to_float(block.get("start")), _to_float(block.get("end"))) for block in final_ad_blocks]
+        total_duration = get_audio_duration(mp3_path)
+        total_ad_time = sum(end - start for start, end in cut_regions)
+        ad_ratio = total_ad_time / total_duration if total_duration > 0 else 0
+        if ad_ratio > 0.50:
+            self._emit_progress("failed", mp3_path, phase="detection", reason="safety_guardrail")
+            raise RuntimeError(
+                f"SAFETY: Ad time ({total_ad_time:.1f}s) is {ad_ratio * 100:.0f}% of episode ({total_duration:.1f}s)"
+            )
 
-    def _cut_audio(self, mp3_path: Path, cut_regions: List[Tuple[float, float]], segments: List[dict]):
+        if dry_run:
+            logger.info(
+                "DRY RUN: Would cut %.1fs of ads (%.0f%% of %.1fs) from %s",
+                total_ad_time,
+                ad_ratio * 100,
+                total_duration,
+                mp3_path.name,
+            )
+            for region_start, region_end in cut_regions:
+                logger.info("  Would cut: %.2fs - %.2fs (%.1fs)", region_start, region_end, region_end - region_start)
+            self._emit_progress("processed", mp3_path, phase="detection", reason="dry_run")
+            return "processed"
+
+        self._emit_progress("cutting_audio", mp3_path, phase="detection")
+        try:
+            backup_path = self._cut_audio(mp3_path, cut_regions, segments)
+        except Exception:
+            self._emit_progress("failed", mp3_path, phase="detection", reason="cut_failed")
+            raise
+        sidecar["status"] = "success"
+        sidecar["backup_path"] = backup_path
+        sidecar["backup_srt_path"] = str(Path(backup_path).with_suffix(".srt")) if backup_path else None
+        sidecar["processing_info"]["processed_at"] = utc_now_iso()
+        sidecar["processing_info"]["processing_time_seconds"] = time.monotonic() - started_at
+        self._save_sidecar(mp3_path)
+        self._emit_progress("processed", mp3_path, phase="detection")
+        return "processed"
+
+    def _cut_audio(self, mp3_path: Path, cut_regions: List[Tuple[float, float]], segments: List[dict]) -> str | None:
         out_path = mp3_path.with_name(f"{mp3_path.stem}-clean.mp3")
         total_duration = get_audio_duration(mp3_path)
 
@@ -1178,136 +1526,213 @@ class Processor:
         logger.info("Executing robust cut with re-encode...")
         subprocess.run(cmd, check=True)
 
-        if self.config.output_scheme == "overwrite_with_backup" or self.config.output_scheme == "overwrite_no_backup":
-            if self.config.output_scheme == "overwrite_with_backup":
-                backup_dir = mp3_path.parent / "backup"
-                backup_dir.mkdir(exist_ok=True)
-                
-                # Backup originals (audio + transcripts)
-                for ext in [".mp3", ".srt", ".words.json"]:
-                    orig_file = mp3_path.with_suffix(ext)
-                    if orig_file.exists():
-                        backup_file = backup_dir / orig_file.name
-                        shutil.copy2(orig_file, backup_file)
+        backup_path: str | None = None
+        if self.config.backup_enabled:
+            # Backup original mp3/SRT to configured backup location.
+            backup_dir = Path(self.config.backup_location).expanduser()
+            if not backup_dir.is_absolute():
+                backup_dir = (mp3_path.parent / backup_dir).resolve()
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_file = backup_dir / mp3_path.name
+            backup_srt = backup_dir / mp3_path.with_suffix(".srt").name
 
-            shutil.move(out_path, mp3_path)
-            
-            # Shift transcripts and overwrite main instances
-            shifted_segments = shift_transcript(segments, keep_regions)
-            save_words_json(shifted_segments, mp3_path.with_suffix(".words.json"))
-            save_srt(shifted_segments, mp3_path.with_suffix(".srt"))
-            
-            logger.info("Done. Clean file and updated transcripts are at %s", mp3_path)
-        else:
-            # save_as_clean: also generate shifted transcripts for the clean file
-            shifted_segments = shift_transcript(segments, keep_regions)
-            save_words_json(shifted_segments, mp3_path.with_name(f"{mp3_path.stem}-clean.words.json"))
-            save_srt(shifted_segments, mp3_path.with_name(f"{mp3_path.stem}-clean.srt"))
-            logger.info("Done. Clean file and shifted transcripts generated: %s", out_path.name)
+            shutil.copy2(mp3_path, backup_file)
+            srt_path = mp3_path.with_suffix(".srt")
+            if srt_path.exists():
+                shutil.copy2(srt_path, backup_srt)
+            backup_path = str(backup_file.absolute())
+
+        shutil.move(out_path, mp3_path)
+
+        shifted_segments = shift_transcript(segments, keep_regions)
+        save_srt(shifted_segments, mp3_path.with_suffix(".srt"))
+        logger.info("Done. Clean file and updated transcript are at %s", mp3_path)
+
+        return backup_path
 
 
-def should_process_mp3(path: Path) -> bool:
+def should_process_mp3(path: Path, excluded_dirs: Set[Path] | None = None) -> bool:
     if path.suffix.lower() != ".mp3":
         return False
     if "backup" in path.parts:
         return False
+    if excluded_dirs:
+        try:
+            resolved_path = path.resolve()
+        except OSError:
+            resolved_path = path.absolute()
+        for excluded_dir in excluded_dirs:
+            try:
+                resolved_path.relative_to(excluded_dir)
+                return False
+            except ValueError:
+                continue
     name = path.name.lower()
     return not (name.endswith("-backup.mp3") or name.endswith("-clean.mp3"))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Podsponsor - Podcast Ad Remover")
-    parser.add_argument("path", nargs="?", help="Path to podcast MP3 or directory")
-    parser.add_argument("--list-patterns", action="store_true", help="List known global ad patterns")
-    parser.add_argument("--clear-patterns", action="store_true", help="Clear global pattern DB")
-    parser.add_argument("--force", action="store_true", help="Reprocess files even if manifest says success")
-    parser.add_argument("--dry-run", action="store_true", help="Detect ads and show what would be cut without modifying any files")
-    parser.add_argument("--config", default="config.yaml", help="Path to config file")
-    parser.add_argument("--transcribe-only", action="store_true", help="Only generate .srt and .words.json files, skip LLM and cutting")
-
+    parser = build_arg_parser()
     args = parser.parse_args()
-
-    if args.list_patterns:
-        db = GlobalPatternDB()
-        print(f"Found {len(db.patterns)} known global ad patterns.")
-        for i, pattern in enumerate(db.patterns):
-            print(f"[{i}] {pattern[:100]}...")
-        return
-
-    if args.clear_patterns:
-        db = GlobalPatternDB()
-        db.patterns = []
-        db.save()
-        print("Global pattern DB cleared.")
-        return
+    progress_mode = resolve_progress_mode(
+        progress_flag=args.progress,
+        stderr_is_tty=sys.stderr.isatty(),
+        tqdm_available=tqdm is not None,
+    )
+    log_file_override = Path(args.log_file).expanduser() if args.log_file else None
+    configure_logging(use_tqdm_console=(progress_mode == "tqdm"), log_file=log_file_override)
+    progress = RunProgressManager(mode=progress_mode)
+    run_started_at = time.monotonic()
 
     if not args.path:
         parser.print_help()
+        progress.close()
         return
 
     path = Path(args.path)
     if not path.exists():
-        print("Path not found.")
+        logger.error("Path not found: %s", path)
+        progress.close()
         sys.exit(1)
 
-    processor = Processor(args.config)
+    def on_processor_progress(event: str, mp3_path: Path | None, _payload: Dict[str, Any]):
+        progress.set_status(mp3_path, event)
+
+    processor = Processor(args.config, progress_callback=on_processor_progress)
 
     targets: List[Path] = []
-    if path.is_file() and should_process_mp3(path):
+    excluded_dirs: Set[Path] = set()
+    configured_backup_dir = Path(processor.config.backup_location).expanduser()
+    if not configured_backup_dir.is_absolute():
+        base_dir = path.parent if path.is_file() else path
+        configured_backup_dir = (base_dir / configured_backup_dir).resolve()
+    else:
+        configured_backup_dir = configured_backup_dir.resolve()
+    excluded_dirs.add(configured_backup_dir)
+
+    if path.is_file() and should_process_mp3(path, excluded_dirs=excluded_dirs):
         targets.append(path)
     elif path.is_dir():
         for candidate in path.rglob("*"):
-            if candidate.is_file() and should_process_mp3(candidate):
+            if candidate.is_file() and should_process_mp3(candidate, excluded_dirs=excluded_dirs):
                 targets.append(candidate)
 
     targets.sort()
     logger.info("Found %d files to process.", len(targets))
 
-    # Identify new targets that actually need cross-matching and processing
-    new_targets = {t for t in targets if not processor._get_manifest(t.parent).should_skip(t, force=args.force)}
-    logger.info("%d files identified as new/unprocessed.", len(new_targets))
+    for target in targets:
+        processor._ensure_sidecar(target)
+
+    def needs_processing(mp3_path: Path) -> bool:
+        sidecar = processor._ensure_sidecar(mp3_path)
+        return args.force or args.update or sidecar.get("status") != "success"
 
     # Phase 1: Transcribe all files
     logger.info("=== Phase 1: Transcription ===")
+    progress.start_phase("Phase 1: Transcription", total=len(targets))
+    phase1_failed = 0
     for target in targets:
+        item_started = time.monotonic()
+        progress.start_item(target)
         try:
             processor.ensure_transcription(target)
         except Exception as exc:
+            phase1_failed += 1
+            progress.set_status(target, "failed")
             logger.error("Transcription failed for %s: %s", target.name, exc)
+        finally:
+            progress.complete_item(time.monotonic() - item_started)
 
     if args.transcribe_only:
-        logger.info("--transcribe-only flag detected. Transcription complete. Exiting.")
+        progress.close()
+        logger.info(
+            "--transcribe-only flag detected. Transcription complete. failed=%d elapsed=%s",
+            phase1_failed,
+            _format_duration(time.monotonic() - run_started_at),
+        )
         return
+
+    logger.info("=== Segment Frequency ===")
+    processor.update_segment_frequencies(targets)
 
     # Preload segments to memory for massive I/O speedup
     logger.info("=== Preloading Data ===")
     processor.preload_all_segments(targets)
 
+    new_targets = {t for t in targets if needs_processing(t)}
+    logger.info("%d files identified as new/unprocessed.", len(new_targets))
+
     # Cross-file matching
     logger.info("=== Cross-File Matching ===")
+    cross_started = False
+
+    def on_fuzzy_progress(payload: Dict[str, Any]):
+        nonlocal cross_started
+        chunks_total = int(payload.get("chunks_total", 0))
+        if not cross_started:
+            progress.start_cross_file(chunks_total)
+            cross_started = True
+        progress.update_cross_file(
+            chunks_done=int(payload.get("chunks_done", 0)),
+            chunks_total=chunks_total,
+            comparisons=int(payload.get("comparisons", 0)),
+            matches=int(payload.get("matches", 0)),
+            elapsed=float(payload.get("elapsed", 0.0)),
+        )
+
     suspicious = find_repeated_segments(
         targets,
         new_targets,
         processor.config.sim_thresh, 
-        load_all_segments_func=processor.load_all_segments
+        load_all_segments_func=processor.load_all_segments,
+        fuzzy_progress_callback=on_fuzzy_progress,
     )
 
     # Phase 2: Detect & cut
     logger.info("=== Phase 2: Detection & Cutting ===")
     processed = 0
     skipped = 0
-    failed = 0
+    failed = phase1_failed
+    phase2_targets = [t for t in targets if needs_processing(t)]
+    progress.start_phase("Phase 2: Detection & Cutting", total=len(phase2_targets))
 
     for target in targets:
-        status = processor.process_file(target, suspicious=suspicious.get(target, set()), force=args.force, dry_run=args.dry_run)
+        if not needs_processing(target):
+            skipped += 1
+            logger.info("Skipping already successful file: %s", target.name)
+            continue
+
+        item_started = time.monotonic()
+        progress.start_item(target)
+        try:
+            status = processor.process_file(
+                target,
+                suspicious=suspicious.get(target, set()),
+                force=args.force,
+                dry_run=args.dry_run,
+                update=args.update,
+            )
+        except Exception as exc:
+            failed += 1
+            progress.set_status(target, "failed")
+            logger.error("Processing failed for %s: %s", target.name, exc)
+            progress.complete_item(time.monotonic() - item_started)
+            continue
+
+        progress.complete_item(time.monotonic() - item_started)
         if status == "processed":
             processed += 1
-        elif status == "skipped":
-            skipped += 1
         else:
-            failed += 1
+            skipped += 1
 
-    logger.info("Run complete. processed=%d skipped=%d failed=%d", processed, skipped, failed)
+    progress.close()
+    logger.info(
+        "Run complete. processed=%d skipped=%d failed=%d elapsed=%s",
+        processed,
+        skipped,
+        failed,
+        _format_duration(time.monotonic() - run_started_at),
+    )
 
 
 if __name__ == "__main__":

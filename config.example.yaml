@@ -2,34 +2,22 @@ whisper:
   model: medium
   device: cuda
   compute_type: float16
+  # Smaller chunks generally produce shorter segments (trade-off: slower transcription).
+  # WhisperX default is typically ~30s; Podsponsor defaults to 20 if omitted.
+  chunk_size: 20
 
 llm:
-  # The unified prompt used to instruct the LLM. 
-  # Use {summary_language} to inject the language preference dynamically.
+  # Summary language (also used in headings). If you want to override the built-in prompt,
+  # add `prompt:` here and use `{summary_language}` in the prompt text.
   summary_language: Turkish
-  prompt: >
-    You are an expert podcast analyst. Your job is to identify sponsor ad reads and generate a detailed summary of the episode.
-    The episode summary must strictly be written in {summary_language}.
-
-    Here are the transcribed audio segments. Each segment has an ID. Some segments are marked with [REPEATED].
-    Segments marked with [REPEATED] appeared in exact identical wording across multiple episodes.
-    These are almost always pre-recorded sponsorships, intro/outro music, or generic host promos.
-
-    Instructions for Ad Detection:
-    1. Look specifically for the [REPEATED] segments as strong hints.
-    2. Expand your search slightly before and after the [REPEATED] markers to capture the full natural boundary of the ad read.
-    3. Look for explicit sponsor read transitions like "This episode is brought to you by..." or discount codes.
-    4. Group contiguous segments into a single block.
-
-    Return the detected ad blocks with their starting and ending segment indices.
 
   # You can list multiple OpenAI-compatible API endpoints here. 
   # If the first provider hits a Rate Limit, Timeout, or API Error, the script gracefully falls back to the next one in the list.
   providers:
-    - base_url: https://api.synthetic.new/openai/v1
-      model: hf:moonshotai/Kimi-K2.5
-      api_key: "syn_..."
-      timeout_seconds: 600
+    - base_url: 
+      model: 
+      api_key: 
+      timeout_seconds: 60
 
 detection:
   similarity_threshold: 0.80
@@ -38,11 +26,9 @@ detection:
   min_confidence: 0.70
   min_ad_duration: 8.0
 
-processing:
-  # Output schema defines what happens to the output file. Options:
-  # "overwrite_with_backup" -> Default. Moves original .mp3, .srt, .words.json to a backup/ folder, then overwrites.
-  # "overwrite_no_backup"   -> Danger. Destructively overwrites original files with the clean copies. No backup.
-  # "save_as_clean"         -> Safe. Leaves original files untouched, creates episodename-clean.mp3.
-  output_scheme: overwrite_with_backup
-  manifest_name: .podsponsor-manifest.json
-  local_ads_name: ads.json
+backup:
+  # Disable to skip writing any backup files.
+  enabled: true
+  # Relative paths are resolved from each episode directory.
+  # Absolute paths are used as-is.
+  location: backup

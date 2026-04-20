@@ -13,21 +13,22 @@ Podsponsor abandons single-pass processing for a smarter, two-phase pipeline:
 
 1. **Phase 1: Batch Transcription & Cross-Matching**
    - Transcribes all your un-processed podcast episodes in a folder using `whisperx`.
-   - Caches the precise word-level timings into a `.words.json` file.
+   - Stores transcript segments directly in `<episode>.podsponsor.json`.
    - Scans all transcripts against each other using fuzzy string matching. If the exact same paragraph appears in Episode 12 and Episode 40, it is flagged as `[REPEATED]`.
 
 2. **Phase 2: LLM Validation & Cutting**
-   - The transcript, enhanced with `[REPEATED]` markers, is sent to an LLM via a strict JSON structued output (`response_format`).
+   - The transcript, enhanced with `[REPEATED]` and `[HIGH_FREQ]` markers, is sent to an LLM via strict JSON structured output (`response_format`).
    - The LLM easily identifies the exact start and end segments of the ad blocks, and also writes a summary of the episode.
-   - `ffmpeg` surgically removes the ad blocks based on the exact word-level timings.
-   - The algorithm mathematically shifts timestamps in your `.srt` and `.words.json` files so that your transcripts remain perfectly synced with the newly cleaned, ad-free audio.
+   - `ffmpeg` surgically removes the ad blocks based on segment timings.
+   - The algorithm mathematically shifts timestamps in your `.srt` file so it remains synced with the cleaned audio.
 
 ## ✨ Features
-- **GPU-Accelerated Transcription ⚡**: Uses `whisperx` for fast transcription and precise word alignments.
-- **Fail-Safe Processing 🛡️**: Original `.mp3` and transcript files are safely saved in a `backup/` subfolder before any destructive cuts are made.
+- **GPU-Accelerated Transcription ⚡**: Uses `whisperx` for fast transcription and segment-level timing data.
+- **Transparent Ad Signals 🧭**: LLM detection uses repeated-content markers and high-frequency hints to improve sponsor block boundary decisions.
+- **Fail-Safe Processing 🛡️**: Original `.mp3` files are safely saved before cuts are applied (backup location is configurable).
 - **Multi-Provider LLM Fallback 🔄**: Define a list of API providers (OpenAI, Ollama, synthetic.new, etc). If one hits a rate limit or times out, Podsponsor instantly fails over to the next provider.
 - **Automatic Summarization 📝**: Generates a beautiful `.md` summary of the podcast episode in your language of choice.
-- **Resume Capability 💾**: Tracks processing state per file in a hidden `.podsponsor-manifest.json` file. You can stop and resume the script at any time without losing work.
+- **Resume Capability 💾**: Tracks processing state per episode in `<episode>.podsponsor.json`.
 
 ## 🚀 Installation
 
@@ -56,10 +57,32 @@ python podsponsor.py /path/to/audiobookshelf/podcasts/folder/
 
 ### Configuration Options (`config.yaml`)
 
-- **`whisper`**: Define the model size (`medium`, `large-v2`), device (`cuda`, `cpu`), and compute type (`float16`).
-- **`llm`**: Set your `summary_language`, edit the prompt instructions, and define your `providers` array for failover support.
+- **`whisper`**: Define the model size (`medium`, `large-v2`), device (`cuda`, `cpu`), compute type (`float16`), and optional `chunk_size` (default `20`) to bias toward shorter/longer segment chunks.
+- **`llm`**: Set your `summary_language` and define your `providers` array for failover support. (Optional) override the default prompt by adding `llm.prompt`.
 - **`detection`**: Tweak confidence thresholds and set guardrails (e.g., maximum allowed ad cut duration).
-- **`processing`**: Control the `output_scheme` (`overwrite_with_backup`, `overwrite_no_backup`, `save_as_clean`).
+- **`backup`**: Set `enabled: false` to disable backups entirely, or configure `location` for where original `.mp3`/`.srt` backups are stored (relative path per episode directory or absolute path).
+
+### Example Summary Output (`.md`)
+
+```md
+# 🎧 Episode Summary: Habit Design and Attention Management
+## 🧭 Overview
+- The episode covers triggers and environment design that make building lasting habits difficult.
+- It suggests simple systems and measurable routines to reduce distraction.
+
+## 🧩 Topics
+### Environment Design
+- It explains a “reduce friction” approach to make desired behavior easier.
+- It gives examples of increasing friction for unwanted behaviors.
+
+## 🧠 Key Takeaways
+- Lower the starting threshold: begin with a small version, then scale up.
+- Design your environment around the goal; don’t rely on willpower alone.
+
+## 📚 Mentioned References
+- 📖 Atomic Habits — James Clear
+- 👤 B. J. Fogg — mentioned in the context of the behavior change model
+```
 
 ## Testing
 To run the test suite, install `pytest` and execute:
